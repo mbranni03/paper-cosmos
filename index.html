@@ -1,0 +1,1173 @@
+<meta charset="utf-8">
+<title>Paper Cosmos</title>
+<style>
+  :root { --stage: #17140f; --text: #d9d0bf; --muted: #8a8172; --accent: #f26b2c; --ink: #2a2420; color-scheme: dark; }
+  html, body { height: 100%; }
+  body {
+    margin: 0; box-sizing: border-box; padding-inline: 16px; overflow: hidden;
+    background: var(--stage); color: var(--text);
+    display: grid; place-content: center; justify-items: center; gap: 12px;
+    font: 12px/1.4 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  #stage { position: relative; width: min(calc(100vw - 32px), calc((100vh - 72px) * 16 / 9)); max-width: 100%; }
+  canvas { display: block; width: 100%; height: auto; aspect-ratio: 16 / 9; background: #f4efe4; box-shadow: 0 18px 60px rgba(0, 0, 0, .55); cursor: pointer; }
+  #play {
+    position: absolute; left: 50%; top: 30%; translate: -50% -50%; font-size: clamp(9px, 2.2vw, 16px); width: 5.75em; height: 5.75em; padding: 0; cursor: pointer;
+    border: 3px solid var(--ink); border-radius: 46% 54% 50% 50% / 52% 46% 54% 48%;
+    background: var(--accent); box-shadow: 3px 4px 0 var(--ink); transition: transform .15s;
+  }
+  #play::after { content: ""; position: absolute; left: 2.2em; top: 1.65em; border: 1.2em solid transparent; border-left: 1.75em solid var(--ink); border-right: 0; }
+  #play:hover { transform: rotate(-4deg) scale(1.05); }
+  #play:focus-visible { outline: 3px dashed var(--text); outline-offset: 6px; }
+  #hint { margin: 0; color: var(--muted); letter-spacing: .04em; text-align: center; min-height: 1.4em; }
+</style>
+
+<div id="stage">
+  <canvas id="c" width="1280" height="720" aria-label="Paper Cosmos: a 30 second hand-drawn animation"></canvas>
+  <button id="play" aria-label="Play with sound"></button>
+</div>
+<p id="hint">space play/pause &middot; &larr;/&rarr; seek &middot; 1-0 jump to scene &middot; L loop</p>
+
+<script>
+'use strict';
+// =====================================================================
+//  TIMELINE - the one place to tweak pacing. Scene lengths are in beats;
+//  visuals AND music are laid out from this table, so they stay in sync.
+// =====================================================================
+const BPM = 96;
+const SCENES = [
+  // id           beats  chord = [bass, ...pad voicing] (MIDI notes)
+  ['intro',         6,   [38, 50, 57, 61, 64, 66]],  // Dmaj9      drop, blink, wave; rings open a portal
+  ['neuron',        6,   [35, 47, 54, 57, 61, 62]],  // Bm9        cosmic flash -> blue neuron (B&W flash)
+  ['prism',         4,   [40, 52, 59, 62, 66, 67]],  // Em9        glass prism splits white light
+  ['dna',           4,   [33, 45, 52, 55, 62, 64]],  // A7sus4     rainbow twists into DNA -> spiral of dots
+  ['sunflower',     4,   [38, 50, 57, 61, 66, 69]],  // Dmaj7      spiral locks into a sunflower, petals bloom
+  ['flock',         6,   [31, 43, 50, 54, 57, 59]],  // Gmaj9      seeds scatter into a murmuration -> disc
+  ['blackhole',     4,   [34, 46, 53, 57, 62, 64]],  // Bbmaj7#11  disc ignites around a black hole -> streak
+  ['moon',          4,   [36, 48, 55, 62, 64, 69]],  // C6/9       streak flies over the moon toward Earth
+  ['tunnel',        4,   [33, 45, 52, 55, 61, 64]],  // A7         warp into a fractal tunnel -> paper
+  ['outro',         6,   [38, 50, 57, 59, 64, 66]],  // D6/9       character returns, arms up, ^ ^
+];
+const BEAT = 60 / BPM;
+let acc = 0;
+const S = SCENES.map(([id, beats, chord]) => ({ id, beats, chord, b0: acc, b1: acc += beats }));
+const DUR = acc * BEAT;                 // 48 beats @ 96 bpm = 30 s
+const SC = Object.fromEntries(S.map(s => [s.id, s]));
+const POSTER = 2.1;                     // still frame shown before play
+
+// ---------- math ----------
+const W = 1280, H = 720, TAU = Math.PI * 2;
+const clamp = (x, a = 0, b = 1) => x < a ? a : x > b ? b : x;
+const lerp = (a, b, t) => a + (b - a) * t;
+const inv = (a, b, x) => clamp((x - a) / (b - a));
+const ss = t => t * t * (3 - 2 * t);
+const eio = t => t < .5 ? 4 * t * t * t : 1 - (-2 * t + 2) ** 3 / 2;
+const eout = t => 1 - (1 - t) ** 3;
+const ein = t => t * t * t;
+const eback = t => 1 + 2.70158 * (t - 1) ** 3 + 1.70158 * (t - 1) ** 2;   // ease-out with overshoot
+const hash = n => { const s = Math.sin(n * 91.345 + 17.17) * 43758.5453; return s - Math.floor(s); };
+const rng = a => () => { a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; };
+const hex = h => [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16));
+const rgba = (c, a = 1) => `rgba(${c[0] | 0},${c[1] | 0},${c[2] | 0},${a})`;
+const mtof = m => 440 * 2 ** ((m - 69) / 12);
+
+// ---------- canvas, textures, sprites ----------
+const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+const mk = (w, h) => Object.assign(document.createElement('canvas'), { width: w, height: h });
+let BOIL = 0;                           // changes 12x/s: sketchy lines "boil" like hand-drawn frames
+
+const PAPER = (() => {
+  const c = mk(W, H), g = c.getContext('2d'), R = rng(11);
+  g.fillStyle = '#f7f3ea'; g.fillRect(0, 0, W, H);
+  for (let i = 0; i < 26; i++) {
+    const x = R() * W, y = R() * H, r = 80 + R() * 320, gr = g.createRadialGradient(x, y, 0, x, y, r);
+    gr.addColorStop(0, R() < .5 ? 'rgba(160,130,90,.035)' : 'rgba(255,255,250,.06)'); gr.addColorStop(1, 'rgba(0,0,0,0)');
+    g.fillStyle = gr; g.fillRect(x - r, y - r, 2 * r, 2 * r);
+  }
+  const im = g.getImageData(0, 0, W, H), d = im.data;
+  for (let i = 0; i < d.length; i += 4) { const n = (R() - .5) * 12; d[i] += n; d[i + 1] += n; d[i + 2] += n * 1.15; }
+  g.putImageData(im, 0, 0);
+  g.lineWidth = 1; g.lineCap = 'round';
+  for (let i = 0; i < 900; i++) {
+    const x = R() * W, y = R() * H, a = R() * TAU, l = 3 + R() * 12;
+    g.strokeStyle = R() < .7 ? 'rgba(110,90,60,.08)' : 'rgba(255,255,255,.4)';
+    g.beginPath(); g.moveTo(x, y);
+    g.quadraticCurveTo(x + Math.cos(a) * l / 2 + (R() - .5) * 3, y + Math.sin(a) * l / 2 + (R() - .5) * 3, x + Math.cos(a) * l, y + Math.sin(a) * l); g.stroke();
+  }
+  const v = g.createRadialGradient(W / 2, H / 2, H * .3, W / 2, H / 2, H * 1.05);
+  v.addColorStop(0, 'rgba(0,0,0,0)'); v.addColorStop(1, 'rgba(95,70,40,.16)');
+  g.fillStyle = v; g.fillRect(0, 0, W, H);
+  return c;
+})();
+
+const GRAIN = (() => {
+  const c = mk(256, 256), g = c.getContext('2d'), im = g.createImageData(256, 256), R = rng(5);
+  for (let i = 0; i < im.data.length; i += 4) { im.data[i] = im.data[i + 1] = im.data[i + 2] = 128 + (R() - .5) * 110; im.data[i + 3] = 255; }
+  g.putImageData(im, 0, 0); return ctx.createPattern(c, 'repeat');
+})();
+
+const SPR = {};
+function spr(col, soft) {            // cached radial sprite; soft = pure colour falloff (no hot core)
+  const key = col + (soft ? 's' : '');
+  if (SPR[key]) return SPR[key];
+  const c = mk(64, 64), g = c.getContext('2d'), [r, gg, b] = hex(col), gr = g.createRadialGradient(32, 32, 0, 32, 32, 32);
+  if (soft) { gr.addColorStop(0, `rgba(${r},${gg},${b},1)`); gr.addColorStop(.5, `rgba(${r},${gg},${b},.35)`); }
+  else { gr.addColorStop(0, 'rgba(255,255,255,1)'); gr.addColorStop(.2, `rgba(${r},${gg},${b},.85)`); gr.addColorStop(.5, `rgba(${r},${gg},${b},.22)`); }
+  gr.addColorStop(1, `rgba(${r},${gg},${b},0)`);
+  g.fillStyle = gr; g.fillRect(0, 0, 64, 64); return SPR[key] = c;
+}
+function glow(col, x, y, r, a = 1, soft) { if (a <= 0 || r <= 0) return; ctx.globalAlpha = Math.min(1, a); ctx.drawImage(spr(col, soft), x - r, y - r, 2 * r, 2 * r); }
+const additive = f => { ctx.save(); ctx.globalCompositeOperation = 'lighter'; f(); ctx.restore(); };
+
+// ---------- sketchy strokes ----------
+const jit = (k, a) => (hash(k * 7.31 + BOIL * 13.7) - .5) * 2 * a;
+function sline(x1, y1, x2, y2, a = 1.2, id = 0, passes = 2) {   // hand-drawn segment (adds to current path)
+  const dx = x2 - x1, dy = y2 - y1, len = Math.hypot(dx, dy) || 1, nx = -dy / len, ny = dx / len;
+  for (let p = 0; p < passes; p++) {
+    const k = id * 3.7 + p * 11.1, bow = jit(k, a * 1.5 + len * .006);
+    ctx.moveTo(x1 + jit(k + 1, a), y1 + jit(k + 2, a));
+    ctx.quadraticCurveTo((x1 + x2) / 2 + nx * bow, (y1 + y2) / 2 + ny * bow, x2 + jit(k + 3, a), y2 + jit(k + 4, a));
+  }
+}
+function sellipse(cx, cy, rx, ry, id = 0, a = .04, passes = 2) { // wobbly loop that overshoots its start
+  for (let p = 0; p < passes; p++) {
+    const k = id * 5.1 + p * 9.3, ph = hash(k + BOIL) * TAU, ph2 = hash(k * 2 + BOIL) * TAU, st = hash(k * 3 + BOIL) * TAU, n = 44;
+    for (let i = 0; i <= n + 3; i++) {
+      const t = st + i / n * TAU, w = 1 + a * (Math.sin(t * 2 + ph) * .6 + Math.sin(t * 3 + ph2) * .4) + (i > n ? a * (i - n) * .6 : 0);
+      i ? ctx.lineTo(cx + Math.cos(t) * rx * w, cy + Math.sin(t) * ry * w) : ctx.moveTo(cx + Math.cos(t) * rx * w, cy + Math.sin(t) * ry * w);
+    }
+  }
+}
+
+// ---------- the mascot ----------
+const ORANGE = '#f26b2c', INK = '#2a2420', GY = 468, CX0 = 640;   // ground line y, character x
+function drawChar(x, y, o = {}) {        // (x, y) = feet on the ground
+  const { sx = 1, sy = 1, rot = 0, armL = .35, armR = .35, eyes = 'open', blink = 0, scale = 1 } = o;
+  if (scale <= .002) return;
+  const bw = 58, bh = 72, leg = 12, top = -leg - bh, L = -bw / 2, R = bw / 2, B = -leg;
+  ctx.save(); ctx.translate(x, y); ctx.rotate(rot);
+  ctx.translate(0, -48); ctx.scale(scale, scale); ctx.translate(0, 48);   // shrink about the body centre
+  ctx.scale(sx, sy);                                                      // squash about the feet
+  ctx.lineCap = ctx.lineJoin = 'round'; ctx.strokeStyle = INK;
+  ctx.lineWidth = 5.5; ctx.beginPath(); sline(-12, B - 2, -12, 0, .6, 1, 1); sline(12, B - 2, 12, 0, .6, 2, 1); ctx.stroke();
+  const ay = top + bh * .4, al = 19;                                      // arms: 0 = hanging, PI = straight up
+  ctx.beginPath();
+  sline(L + 1, ay, L + 1 - Math.sin(armL) * al, ay + Math.cos(armL) * al, .6, 3, 1);
+  sline(R - 1, ay, R - 1 + Math.sin(armR) * al, ay + Math.cos(armR) * al, .6, 4, 1);
+  ctx.stroke();
+  ctx.fillStyle = ORANGE; ctx.beginPath(); ctx.roundRect(L + 2.5, top + 2, bw, bh, 8); ctx.fill();   // misregistered print fill
+  ctx.save(); ctx.clip(); ctx.strokeStyle = 'rgba(165,50,10,.32)'; ctx.lineWidth = 1.4; ctx.beginPath();
+  for (let i = 0; i < 6; i++) sline(R - 14 + i * 4, top + 6, R - 24 + i * 4, B - 4, .5, 20 + i, 1);
+  ctx.stroke(); ctx.restore();
+  ctx.lineWidth = 2.6; ctx.beginPath();
+  sline(L, top, R, top, .9, 5); sline(R, top, R, B, .9, 6); sline(R, B, L, B, .9, 7); sline(L, B, L, top, .9, 8);
+  ctx.stroke();
+  const ey = top + 26;
+  if (eyes === 'happy') {
+    ctx.lineWidth = 3; ctx.beginPath();
+    for (const ex of [-11, 11]) { ctx.moveTo(ex - 5, ey + 3); ctx.lineTo(ex, ey - 3); ctx.lineTo(ex + 5, ey + 3); }
+    ctx.stroke();
+    ctx.fillStyle = 'rgba(225,60,80,.35)';
+    for (const ex of [-19, 19]) { ctx.beginPath(); ctx.ellipse(ex, ey + 11, 5, 3, 0, 0, TAU); ctx.fill(); }
+  } else {
+    const eh = Math.max(1.6, 9 * (1 - blink));
+    ctx.fillStyle = INK; for (const ex of [-11, 11]) ctx.fillRect(ex - 4, ey - eh / 2, 8, eh);
+    if (blink < .5) { ctx.fillStyle = '#fff'; for (const ex of [-11, 11]) ctx.fillRect(ex - 2, ey - 3, 2.2, 2.2); }
+  }
+  ctx.restore();
+}
+function drop(b, land) {                 // 1-beat gravity fall, then a springy squash
+  if (b < land) { const f = clamp(b - land + 1); return { y: lerp(-40, GY, f * f), sx: .9, sy: 1.12, arm: 2.4 }; }
+  const t = (b - land) * BEAT, q = .32 * Math.exp(-7 * t) * Math.cos(21 * t);
+  return { y: GY, sx: 1 + q * .8, sy: 1 - q, arm: .35 + 2 * Math.exp(-10 * t) };
+}
+function rings(e, a = 1) {              // ripples from the character (e = beats relative to the intro's end); ring 0 is the portal edge
+  ctx.lineCap = 'round'; ctx.globalAlpha = a;
+  for (let k = 0; k < 5; k++) {
+    const r = 950 * inv(-1.75 + k * .3, -.1 + k * .3, e) ** 2; if (r <= 1 || r > 940) continue;
+    ctx.strokeStyle = k === 0 ? INK : k % 2 ? 'rgba(242,107,44,.9)' : 'rgba(244,239,228,.75)';
+    ctx.lineWidth = k === 0 ? 3.5 : 2.2; ctx.beginPath(); sellipse(CX0, FY, r, r, 40 + k, .015); ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
+}
+function faintLine(a = 1, grow = 1) {
+  if (grow <= 0) return;
+  const L = 540 * grow;
+  ctx.strokeStyle = `rgba(70,58,45,${.42 * a})`; ctx.lineWidth = 1.5; ctx.lineCap = 'round';
+  ctx.beginPath(); sline(CX0 - L, GY + 1, CX0, GY, 1, 31); sline(CX0, GY, CX0 + L, GY + 1, 1, 32); ctx.stroke();
+}
+function shadow(y) {
+  const k = clamp(1 - (GY - y) / 520), s = .5 + .5 * k;
+  ctx.fillStyle = `rgba(60,40,20,${.16 * k})`; ctx.beginPath(); ctx.ellipse(CX0, GY + 2, 34 * s, 5 * s, 0, 0, TAU); ctx.fill();
+}
+
+// ---------- shared space bits ----------
+const STARS = Array.from({ length: 260 }, (_, i) => ({ x: hash(i + .1) * W, y: hash(i + .2) * H, r: .6 + hash(i + .3) ** 4 * 2.2, p: hash(i + .4) * TAU }));
+function drawStars(T, a = 1, dx = 0) {
+  ctx.fillStyle = '#fff8ea';
+  for (const s of STARS) {
+    const k = a * (.55 + .45 * Math.sin(T * 1.7 + s.p)); if (k < .03) continue;
+    ctx.globalAlpha = k; ctx.fillRect(((s.x + dx) % W + W) % W, s.y, s.r, s.r);
+  }
+  ctx.globalAlpha = 1;
+}
+const NEB = [[.28, .32, 330, '#3a2a8c'], [.74, .28, 360, '#0f5a78'], [.56, .72, 380, '#7a2a6e'], [.16, .76, 280, '#1d3f8f'], [.88, .74, 260, '#6b1f4f']];
+function drawCosmos(T, a = 1) {
+  ctx.fillStyle = '#070a1c'; ctx.fillRect(0, 0, W, H);
+  additive(() => { for (const [x, y, r, c] of NEB) glow(c, x * W + 30 * Math.sin(T * .3 + x * 7), y * H, r, .5 * a, true); });
+  drawStars(T, a);
+}
+const FX = CX0, FY = GY - 48;             // flash point = where the character vanished
+const BURST = ['#ffd27a', '#7fd8ff', '#ff8fc8', '#b69cff', '#9dffcf', '#ffffff'];
+
+// =====================================================================
+//  SCENES - each draws the full frame for its local beat b (0..beats)
+// =====================================================================
+const DRAW = {
+  intro(b, s, T) {
+    ctx.drawImage(PAPER, 0, 0);
+    faintLine();
+    const d = drop(b, 1), cy = FY;
+    shadow(d.y);
+    const blink = Math.sin(Math.PI * inv(2, 2.18, b));
+    const wave = inv(2.4, 2.6, b) * (1 - inv(4.1, 4.3, b));
+    const armR = lerp(d.arm, 2.55 + .4 * Math.sin((b - 2.4) * TAU * 1.6), wave);
+    const e = b - s.beats, portal = 950 * inv(-1.75, -.1, e) ** 2;   // concentric rings open onto the cosmos
+    if (portal > 0) {
+      ctx.save(); ctx.beginPath(); ctx.arc(CX0, cy, portal, 0, TAU); ctx.clip(); drawCosmos(T); ctx.restore();
+      rings(e);
+    }
+    const shrink = inv(-.9, -.15, e);                       // the character condenses into a star...
+    drawChar(CX0, d.y, { sx: d.sx, sy: d.sy, armL: d.arm, armR, blink, scale: 1 - ein(shrink), rot: .05 * wave * Math.sin((b - 2.4) * TAU * .8) });
+    if (shrink > 0) additive(() => glow('#fff1c9', CX0, cy, 6 + 44 * shrink, shrink));
+  },
+
+  neuron(b, s, T) {                                          // ...which bursts: the cosmic flash -> a neuron
+    const e = b - s.beats, zoom = 1.12 + .22 * ss(inv(.3, s.beats - 1, b));
+    const D = NEURON.maxD * eout(inv(.3, 2.3, b)) * (1 - ein(inv(-1.7, -.6, e)));   // grow out, later retract
+    const mp = eio(inv(-1.5, -.1, e));                         // soma -> prism, axon -> light beam
+    if (b >= 3 && b < 3.5) {                                   // flash to the pencil drawing underneath
+      ctx.drawImage(PAPER, 0, 0);
+      drawNeuron(zoom, D, 'pencil');
+      ctx.strokeStyle = INK; ctx.lineWidth = 2.2; ctx.beginPath(); sellipse(FX, FY, 30 * zoom, 28 * zoom, 70, .08); ctx.stroke();
+      ctx.save(); ctx.beginPath(); ctx.arc(FX, FY, 30 * zoom, 0, TAU); ctx.clip(); ctx.lineWidth = 1; ctx.beginPath();
+      for (let k = -6; k <= 6; k++) sline(FX + k * 6 - 30, FY - 40, FX + k * 6 + 30, FY + 40, .8, 80 + k, 1);
+      ctx.stroke(); ctx.restore();
+      ctx.beginPath(); sellipse(FX + 3, FY - 2, 10 * zoom, 9 * zoom, 71, .1); ctx.stroke();
+      return;
+    }
+    drawCosmos(T, 1 - .6 * inv(1, 3, b));
+    if (b < .8) rings(b, 1 - b / .8);
+    ctx.fillStyle = `rgba(5,5,7,${inv(-1.6, -.2, e)})`; ctx.fillRect(0, 0, W, H);
+    const f = 1 - Math.exp(-3.2 * b), fade = clamp(1.3 - b * .35);
+    additive(() => {
+      for (let i = 0; i < 240; i++) {                        // star burst decelerating outward
+        const a = hash(i * 3.3) * TAU, v = 120 + hash(i * 5.1) * 700, r = v * f, x = FX + Math.cos(a) * r, y = FY + Math.sin(a) * r;
+        if (b < .5) { ctx.strokeStyle = BURST[i % 6]; ctx.globalAlpha = .5 * (1 - b * 2); ctx.lineWidth = 1.5; ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(FX + Math.cos(a) * r * .75, FY + Math.sin(a) * r * .75); ctx.stroke(); }
+        glow(BURST[i % 6], x, y, 2 + hash(i) * 5, fade);
+      }
+    });
+    drawNeuron(zoom, D, 'glow');
+    // axon straightens into the white beam that will hit the prism
+    const ax = NEURON.axon, vis = eout(inv(.3, 2, b)) * ax.length;
+    const pts = ax.slice(0, Math.max(2, Math.ceil(vis))).map(([x, y], k) => {
+      const bx = lerp(E1[0], BEAM0[0], k / (ax.length - 1)), by = lerp(E1[1], BEAM0[1], k / (ax.length - 1));
+      return [lerp(FX + x * zoom, bx, mp), lerp(FY + y * zoom, by, mp)];
+    });
+    glowLine(pts, 5.5 * zoom * (1 - mp) + 4 * mp, mp > .5 ? '#ffffff' : '#5fb4ff', 1);
+    // soma: pulses on every beat, then morphs into the prism outline
+    const pulse = b > 1 && e < -1.6 ? Math.exp(-7 * (b % 1)) : 0;
+    const M = 48, poly = [];
+    for (let k = 0; k < M; k++) {
+      const th = -Math.PI / 2 + k / M * TAU, w = 1 + .08 * Math.sin(th * 3 + T * 2), tp = triPoint(k / M);
+      poly.push([lerp(FX + Math.cos(th) * 30 * zoom * w, tp[0], mp), lerp(FY + Math.sin(th) * 30 * zoom * w, tp[1], mp)]);
+    }
+    ctx.beginPath(); poly.forEach(([x, y], k) => k ? ctx.lineTo(x, y) : ctx.moveTo(x, y)); ctx.closePath();
+    const sg = ctx.createRadialGradient(FX - 6, FY - 6, 2, FX, FY, 34 * zoom);
+    sg.addColorStop(0, `rgba(235,250,255,${1 - mp})`); sg.addColorStop(.45, `rgba(110,200,255,${.95 * (1 - mp)})`); sg.addColorStop(1, `rgba(30,95,214,${.9 * (1 - mp)})`);
+    ctx.fillStyle = sg; ctx.fill(); ctx.fillStyle = `rgba(210,230,255,${.07 * mp})`; ctx.fill();
+    ctx.strokeStyle = `rgba(255,255,255,${.25 + .6 * mp})`; ctx.lineWidth = 1.6; ctx.stroke();
+    additive(() => {
+      glow('#7fd0ff', FX, FY, (70 + 40 * pulse) * zoom, (.8 + .4 * pulse) * (1 - mp));
+      glow('#ffffff', FX, FY, 16 * zoom, (1 - mp));
+      for (let j = 0; j < NEURON.paths.length; j++) {        // signals racing from the dendrites to the soma
+        const path = NEURON.paths[j], u = ((b - 1.1) * .9 + hash(j * 1.7)) % 1, dd = path[0].d1 * (1 - u);
+        if (b < 1.1 || e > -1.7 || dd > D) continue;
+        const sgm = path.find(q => q.d0 <= dd && dd <= q.d1); if (!sgm) continue;
+        const k = (dd - sgm.d0) / (sgm.d1 - sgm.d0);
+        glow('#e6fbff', FX + zoom * lerp(sgm.x1, sgm.x2, k), FY + zoom * lerp(sgm.y1, sgm.y2, k), 8, .9);
+      }
+      const fl = clamp(1 - b / .7); glow('#ffffff', FX, FY, 60 + 900 * (1 - fl), fl * fl * 1.5);   // the flash itself
+    });
+  },
+
+  prism(b, s, T) {                                           // Dark Side energy: white light in, spectrum out
+    ctx.fillStyle = '#050507'; ctx.fillRect(0, 0, W, H);
+    const hb = Math.exp(-5 * (b % 2)) * (b < 3.9 ? 1 : 0);   // heartbeat glow on beats 0 and 2
+    additive(() => glow('#2a2f45', 640, 400, 520, (.5 + .3 * hb) * eout(inv(0, .4, b)), true));
+    glowLine([BEAM0, E1], 4, '#ffffff', 1 + .4 * hb);
+    const inner = eout(inv(.15, .7, b));
+    if (inner > 0) {                                          // refracted light inside the glass
+      ctx.fillStyle = `rgba(255,255,255,${.16 * inner})`; ctx.beginPath(); ctx.moveTo(E1[0], E1[1] - 2); ctx.lineTo(lerp(E1[0], E2[0], inner), lerp(E1[1], E2[1] - 6, inner)); ctx.lineTo(lerp(E1[0], E2[0], inner), lerp(E1[1], E2[1] + 7, inner)); ctx.lineTo(E1[0], E1[1] + 2); ctx.fill();
+    }
+    drawRibbon(ribbonGeom(T, 0), 0, 1 + .25 * hb, j => E2[0] + 556 * eout(inv(.75 + .25 * j, 1.3 + .25 * j, b)));
+    drawPrism(70 * eout(inv(0, .6, b)), .22 * Math.sin(b * .9), -.1 * ss(inv(0, 1, b)), 1);
+    additive(() => { glow('#ffffff', E1[0], E1[1], 26 + 14 * hb, .9); glow('#fff4e0', E2[0], E2[1], 18 * inner, .8); });
+  },
+
+  dna(b, s, T) {                                             // spectrum stretches, twists, becomes rungs, then dissolves
+    ctx.fillStyle = '#050507'; ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = `rgba(16,11,44,${inv(.5, 2.5, b)})`; ctx.fillRect(0, 0, W, H);
+    const e = eio(inv(0, 1.5, b)), rung = ss(inv(.9, 1.8, b)), fp = 1 - inv(0, .8, b), cut = (b - 2.3) / .9 * 1360 - 40;
+    if (fp > 0) {
+      additive(() => glow('#2a2f45', 640, 400, 520, .5 * fp, true));
+      glowLine([BEAM0, E1], 4, '#ffffff', fp);
+      drawPrism(70, .22 * Math.sin((b + 4) * .9), -.1, fp);
+    }
+    const g = ribbonGeom(T, e);
+    strands(g, cut, false, rung);
+    drawRibbon(g, rung, 1, null, cut);
+    strands(g, cut, true, rung);
+    drawSeeds(b + s.b0, T, 0);
+  },
+
+  sunflower(b, s, T) {                                       // golden angle locks in; petals bloom on warm paper-pink
+    ctx.fillStyle = 'rgb(16,11,44)'; ctx.fillRect(0, 0, W, H);
+    const open = 950 * eout(inv(.5, 1.9, b)), sway = inv(-1, 0, b - s.beats);
+    if (open > 0) {
+      ctx.save(); ctx.beginPath(); ctx.arc(640, 360, open, 0, TAU); ctx.clip(); warmBG(); ctx.restore();
+      ctx.strokeStyle = 'rgba(255,214,150,.8)'; ctx.lineWidth = 3; ctx.beginPath(); sellipse(640, 360, open, open, 90, .02); ctx.stroke();
+    }
+    drawSunflower(b, T, sway, -1);
+    drawSeeds(b + s.b0, T, inv(.9, 1.7, b));
+  },
+
+  flock(b, s, T) {                                           // seeds take wing; the murmuration folds into a disc
+    const e = b - s.beats, tilt = TILT * eio(inv(-2.6, 0, e)), T6 = s.b0 * BEAT, tau = T - T6, sunA = inv(0, 1.2, b);
+    skyBG(tilt);
+    warmBG(1 - inv(0, 1.4, b));
+    drawStars(T, inv(150, 500, tilt));
+    const sy = 600 + tilt + 30 * inv(1, s.beats, b);                 // camera tilts up: the sun and hills sink away
+    additive(() => glow('#ffb45a', 640, sy, 280, .55 * sunA, true));
+    ctx.globalAlpha = sunA; ctx.fillStyle = '#ffe3a3'; ctx.beginPath(); ctx.arc(640, sy, 62, 0, TAU); ctx.fill(); ctx.globalAlpha = 1;
+    hills(tilt + 220 * (1 - eout(inv(0, 1.4, b))));
+    drawSunflower(b + SC.sunflower.beats, T, 1, b);
+    const P = [];
+    for (let i = 0; i < NP; i++) {
+      const [x0, y0] = spiral(i, T6), d = .6 * (1 - Math.sqrt(i / NP)), u = eio(inv(d, d + 1.5, b));
+      const [fx, fy, fp] = flockPos(i, tau), hv = hash(i * 8.1), v = eio(inv(-2.4 + .6 * hv, -.5 + .3 * hv, e));
+      const [dx, dy] = discPos(i, T, 14, .32, 150), lift = Math.sin(Math.PI * u) * 90 * (hash(i * 9.7) - .2);
+      P.push([i, lerp(lerp(x0, fx, u) + lift, dx, v), lerp(lerp(y0, fy, u) - lift * .6, dy, v), u, v, fp]);
+    }
+    for (let c = 0; c < 4; c++) {                             // seeds not yet airborne
+      ctx.fillStyle = SEEDCOL[c]; ctx.beginPath();
+      for (const [i, x, y, u] of P) { if (u >= .5 || seedTone(i) !== c) continue; const r = 1.7 + 2.3 * Math.sqrt(i / NP); ctx.moveTo(x + r, y); ctx.arc(x, y, r, 0, TAU); }
+      ctx.fill();
+    }
+    birds(P.filter(p => p[3] >= .5).map(([i, x, y, u, v, fp]) => [i, x, y, lerp(2.8 + 2.4 * fp, birdSize(i), v) * (1 - v * .45)]), T);
+  },
+
+  blackhole(b, s, T) {                                       // the disc ignites around a black hole, then collapses
+    skyBG(TILT); ctx.fillStyle = `rgba(3,3,8,${eout(inv(0, 1.2, b))})`; ctx.fillRect(0, 0, W, H);
+    drawStars(T, 1);
+    const e = b - s.beats, ign = inv(0, .7, b), q = lerp(.32, .02, ein(inv(-1.6, -.6, e))), rin = lerp(14, 84, eout(inv(0, .9, b))), rout = lerp(150, 255, eout(inv(0, 1, b)));
+    const rh = 56 * eout(inv(.1, .8, b)) * (1 - ein(inv(-1.5, -.7, e)));
+    const P = [];
+    for (let i = 0; i < NP; i++) {
+      const [dx, dy, th, rr] = discPos(i, T, rin, q, rout), hv = hash(i * 8.1), k = eio(inv(-1.3 + .5 * hv, -.5 + .3 * hv, e)), [cx, cy] = cometPos(i, T);
+      P.push([lerp(dx, cx, k), lerp(dy, cy, k), th, (rr - rin) / (rout - rin), k, i]);
+    }
+    if (ign < 1) birds(P.map(p => [p[5], p[0], p[1], birdSize(p[5]) * .55]), T, 1 - ign);
+    const dot = ([x, y, th, t, k, i], a) => k > .5 ? cometDot(i, x, y, 1) : glow(HEAT[Math.min(5, t * 6 | 0)], x, y, 4 + 5 * (1 - t), a * ign * (.55 + .45 * (.5 - .5 * Math.cos(th))));
+    additive(() => {
+      ctx.save(); ctx.translate(640, 350); ctx.scale(1, Math.max(q, .05)); glow('#ff8a3a', 0, 0, 300, .5 * ign * (1 - inv(-1.2, -.5, e)), true); glow('#ffd79a', 0, 0, 150, .35 * ign * (1 - inv(-1.2, -.5, e)), true); ctx.restore();
+      for (const p of P) if (Math.sin(p[2]) < 0 && p[4] < .5) dot(p, .85);            // far side, behind the hole
+    });
+    if (rh > .5) {
+      ctx.fillStyle = '#000'; ctx.beginPath(); ctx.arc(640, 350, rh, 0, TAU); ctx.fill();
+      ctx.strokeStyle = 'rgba(255,232,196,.9)'; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(640, 350, rh + 1.5, 0, TAU); ctx.stroke();
+    }
+    additive(() => {
+      if (rh > 4) { ctx.lineCap = 'round'; for (const [w, a, c] of [[26, .22, '#ff9a4a'], [9, .5, '#ffd79a'], [2.5, .8, '#fff6e0']]) { ctx.strokeStyle = c; ctx.globalAlpha = a * ign; ctx.lineWidth = w * rh / 56; ctx.beginPath(); ctx.arc(640, 350, rh * 1.55, Math.PI * 1.04, Math.PI * 1.96); ctx.stroke(); } }
+      if (rh > 4) for (const p of P) {                                                  // lensed image of the far side
+        if (Math.sin(p[2]) >= 0 || p[4] > .5) continue;
+        const rho = rh * 1.25 + p[3] * 229 * .3;
+        glow(HEAT[Math.min(5, p[3] * 6 | 0)], 640 + rho * Math.cos(p[2]), 350 + rho * Math.sin(p[2]), 3 + 3 * (1 - p[3]), .5 * ign);
+      }
+      for (const p of P) if (Math.sin(p[2]) >= 0 || p[4] >= .5) dot(p, .9);           // near side + the streak
+      const fl = clamp(1 - Math.abs(e + .65) / .35); glow('#ffffff', 640, 355, 60 + 340 * fl, fl);
+      const st = inv(-.8, -.3, e); if (st > 0) { glowLine([[330, 360], [1010, 360]], 2.2, '#ffe9c4', st); cometHeadGlow(820, 360, 1, st); }
+    });
+  },
+
+  moon(b, s, T) {                                            // the streak becomes a comet over the moon, Earth ahead
+    const tau = T - s.b0 * BEAT;
+    ctx.fillStyle = '#030308'; ctx.fillRect(0, 0, W, H);
+    drawStars(T, 1, -45 * tau);
+    const [ex, ey, er] = earthAt(tau);
+    drawEarth(ex, ey, er, T);
+    drawComet(T, 1 - .45 * inv(1, s.beats, b));
+    if (b < .6) additive(() => glowLine([[330, 360], [1010, 360]], 2.2, '#ffe9c4', 1 - b / .6));
+    drawMoon(260 * (1 - eout(inv(0, .9, b))), tau * .12);
+    const fl = inv(-.7, 0, b - s.beats); if (fl > 0) additive(() => glow('#dff4ff', ex + 20, ey + 20, er * 1.3 * fl, fl * .9));
+  },
+
+  tunnel(b, s, T) {                                          // dive into Earth -> fractal tunnel -> snap back to paper
+    const tau = T - s.b0 * BEAT, z = eio(inv(0, 1.3, b)), [ex, ey, er] = earthAt(SC.moon.beats * BEAT);
+    ctx.fillStyle = '#030308'; ctx.fillRect(0, 0, W, H);
+    warpLines(tau, inv(0, .35, b) * (1 - inv(1, 1.6, b)));
+    const zx = lerp(ex, 640, z), zy = lerp(ey, 360, z), zr = er * Math.pow(12, z);
+    drawEarth(zx, zy, zr, T);
+    drawComet(T, .55, 1 - inv(0, .4, b));
+    if (b < .6) additive(() => glow('#dff4ff', zx + 20, zy + 20, zr * 1.3, .9 * (1 - b / .6)));
+    drawMoon(260 * ein(inv(0, 1, b)), (tau + SC.moon.beats * BEAT) * .12);
+    const rev = 900 * eio(inv(.55, 1.6, b));
+    if (rev > 0 && TUNNEL) {
+      TUNNEL.draw(tau, Math.exp(-4 * ((b * 2) % 1)) * inv(1, 1.5, b), inv(.6, 1.8, b));
+      ctx.save(); ctx.beginPath(); ctx.arc(640, 360, rev, 0, TAU); ctx.clip(); ctx.drawImage(TUNNEL.c, 0, 0, W, H); ctx.restore();
+      ctx.strokeStyle = 'rgba(255,255,255,.7)'; ctx.lineWidth = 3; ctx.beginPath(); sellipse(640, 360, rev, rev, 120, .03); ctx.stroke();
+    }
+    const e = b - s.beats, hole = e < -.3 ? 36 * inv(-1.6, -.3, e) ** 2 : 36 + 900 * ein(inv(-.3, 0, e));   // light at the end = the paper
+    if (hole > .5) {
+      ctx.save(); ctx.beginPath(); ctx.arc(640, 360, hole, 0, TAU); ctx.clip(); ctx.drawImage(PAPER, 0, 0); ctx.restore();
+      ctx.strokeStyle = INK; ctx.lineWidth = 3; ctx.beginPath(); sellipse(640, 360, hole, hole, 121, .03); ctx.stroke();
+    }
+  },
+
+  outro(b, s, T) {                                           // back on paper: the character returns, arms up, ^ ^
+    ctx.drawImage(PAPER, 0, 0);
+    faintLine(1, eout(inv(.1, .7, b)));
+    for (let k = 0; k < 70; k++) {                            // confetti left over from the tunnel
+      const x = hash(k * 1.9) * W + 30 * Math.sin(b * 2 + k), y = -30 + (b * (140 + 90 * hash(k * 2.7)) + hash(k * 3.1) * 260) * BEAT * 1.6 - 200 * hash(k * 5.3);
+      if (y < -20 || y > H + 20) continue;
+      ctx.save(); ctx.translate(x, y); ctx.rotate(b * 3 + k); ctx.scale(Math.cos(b * 5 + k * 1.7), 1);
+      ctx.fillStyle = k % 6 ? RB[k % 6] : ORANGE; ctx.fillRect(-5, -3, 10, 6); ctx.restore();
+    }
+    const e = b - s.beats, d = drop(b, 1), up = eout(inv(1.1, 1.4, b)), leave = loopOn ? inv(-.7, 0, e) : 0;
+    const hop = b > 1.5 && e < -.9 ? -14 * Math.abs(Math.sin(Math.PI * (b - 1.5))) : 0;
+    const crouch = loopOn ? Math.sin(Math.PI * inv(-1, -.65, e)) * .18 : 0;
+    const y = d.y + hop - 950 * ein(leave);
+    shadow(y);
+    const arm = lerp(d.arm, 2.3 + .15 * Math.sin(b * TAU * 2), up);
+    drawChar(CX0, y, { sx: d.sx * (1 + crouch), sy: d.sy * (1 - crouch), armL: arm, armR: arm, eyes: b > 1.2 ? 'happy' : 'open', rot: .04 * Math.sin(b * Math.PI) * up });
+    if (b > 1.3 && leave < .2) {                               // little joy marks
+      const k = .6 + .4 * Math.sin(b * TAU * 2), cy = y - 84;
+      ctx.strokeStyle = INK; ctx.lineWidth = 2.2; ctx.lineCap = 'round'; ctx.beginPath();
+      for (const sgn of [-1, 1]) for (let j = 0; j < 3; j++) {
+        const a = -Math.PI / 2 + sgn * (.55 + j * .42), r0 = 58, r1 = 58 + 12 * k;
+        sline(CX0 + Math.cos(a) * r0, cy + Math.sin(a) * r0 * .8, CX0 + Math.cos(a) * r1, cy + Math.sin(a) * r1 * .8, .5, 60 + j + sgn, 1);
+      }
+      ctx.stroke();
+    }
+  },
+};
+
+// ---------- sunset, flock, disc, comet ----------
+const TILT = 300;                       // how far the camera tilts up out of the sunset
+function skyBG(dy) {                    // tall world gradient; dy tilts the camera up into the night
+  const g = ctx.createLinearGradient(0, -700 + dy, 0, 720 + dy);
+  [[0, '#06060f'], [.25, '#171032'], [.49, '#3b1d5e'], [.67, '#8a3a7e'], [.8, '#e0607a'], [.89, '#ff9150'], [.95, '#ffc070'], [1, '#ffd890']].forEach(([o, c]) => g.addColorStop(o, c));
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+}
+function hills(dy) {
+  if (dy > 110) return;
+  ctx.fillStyle = '#2a1433'; ctx.beginPath(); ctx.moveTo(0, H + 10);
+  for (let x = 0; x <= W; x += 16) ctx.lineTo(x, 628 + dy + 22 * Math.sin(x * .007 + 1) + 12 * Math.sin(x * .023 + 2) + jit(x, .6));
+  ctx.lineTo(W, H + 10); ctx.fill();
+}
+function flockPos(i, t) {               // a folding, breathing 3D cloud, projected with perspective
+  const h1 = hash(i * 1.7), h2 = hash(i * 2.3), h3 = hash(i * 3.1), r = Math.cbrt(h1), ct = 2 * h2 - 1, st = Math.sqrt(1 - ct * ct), ph = TAU * h3;
+  let x = r * st * Math.cos(ph) * 1.5, y = r * ct * .55, z = r * st * Math.sin(ph) * .9;
+  x += .35 * Math.sin(y * 3 + t * 1.7); y += .22 * Math.sin(x * 2.1 + t * 1.3); z += .3 * Math.sin(x * 2.6 - t * 1.1);
+  const ya = t * .6, ca = Math.cos(ya), sa = Math.sin(ya); [x, z] = [x * ca - z * sa, x * sa + z * ca];
+  const ra = .35 * Math.sin(t * .7), cr = Math.cos(ra), sr = Math.sin(ra); [x, y] = [x * cr - y * sr, x * sr + y * cr];
+  const sx = 1 + .3 * Math.sin(t * .9), sy = 1 - .25 * Math.sin(t * .9 + 1), p = 3.2 / (3.2 + z);
+  return [640 + 190 * Math.sin(t * .9) + x * sx * 200 * p, 240 + 50 * Math.sin(t * 1.4) + y * sy * 200 * p, p];
+}
+const birdSize = i => 3 + 2 * hash(i * 9.1);
+function birds(P, T, a = 1) {           // [i, x, y, half-span] -> flapping chevrons in one stroke
+  ctx.beginPath();
+  for (const [i, x, y, sp] of P) { const fl = Math.sin(T * 17 + i * 1.3) * sp * .7; ctx.moveTo(x - sp, y - fl); ctx.lineTo(x, y + sp * .25); ctx.lineTo(x + sp, y - fl); }
+  ctx.globalAlpha = a; ctx.strokeStyle = '#1a0e20'; ctx.lineWidth = 1.8; ctx.lineJoin = 'round'; ctx.stroke(); ctx.globalAlpha = 1;
+}
+function discPos(i, T, rin, q, rout = 255) {   // Keplerian disc: inner orbits spin faster (phase uses the final orbit, so resizing never whirls)
+  const h = hash(i * 4.4) ** .75, rr = lerp(rin, rout, h), w = 2.2 * Math.pow(80 / lerp(84, 255, h), 1.5), th = hash(i * 5.5) * TAU + w * T;
+  return [640 + rr * Math.cos(th), 350 + rr * Math.sin(th) * q, th, rr];
+}
+const HEAT = ['#fff6e0', '#ffe0a0', '#ffc063', '#ff9640', '#f26b2c', '#c8431f'];
+const T8 = SC.moon.b0 * BEAT, LAG = .8, CV = 480;
+const cometHead = t => t <= 0 ? [820, 360] : (t *= 2.5 / (SC.moon.beats * BEAT), [820 + 40 * t + 10 * t * t, 360 - 20 * t - 14 * t * t]);
+function cometPos(i, T) {               // tail = where the head was, left behind as the camera tracks it
+  const u = i / NP, [hx, hy] = cometHead(T - T8 - u * LAG), sp = 1 + u * 12;
+  return [hx - CV * u * LAG + (hash(i * 6.1) - .5) * sp, hy + (hash(i * 7.3) - .5) * sp, u];
+}
+function cometDot(i, x, y, hs, a = 1) { const u = i / NP; glow(u < .15 ? '#fff6e0' : u < .5 ? '#ffd28a' : '#ff9a4a', x, y, (7 - 5 * u) * hs, (1 - u) * .8 * a); }
+function cometHeadGlow(x, y, hs, a) { glow('#ffffff', x, y, 26 * hs, a); glow('#ffcf8a', x, y, 70 * hs, .5 * a, true); }
+function drawComet(T, hs = 1, a = 1) {
+  if (a <= 0) return;
+  additive(() => {
+    for (let i = NP - 1; i >= 0; i--) { const [x, y] = cometPos(i, T); cometDot(i, x, y, hs, a); }
+    const [hx, hy] = cometHead(T - T8); cometHeadGlow(hx, hy, hs, a);
+  });
+}
+
+// ---------- moon, earth, warp, tunnel ----------
+const earthAt = t => (t *= 2.5 / (SC.moon.beats * BEAT), [1080 - 50 * t, 170 + 12 * t, 40 * Math.pow(1.8, t)]);   // path normalised to the moon scene
+const CONT = [[.2, .5, .55], [1.4, -.2, .6], [2.4, .9, .4], [3.3, -.6, .5], [4.4, .3, .7], [5.4, -.9, .35], [.9, -1.1, .3]];
+const CLOUD = [[.6, .3, .35], [2, -.5, .3], [3.1, .7, .28], [4.2, -.1, .4], [5.6, .5, .3]];
+function blob(x, y, r, lon0, lat0, sz, rot, stretch) {   // wobbly patch on a spinning sphere (orthographic)
+  if (Math.cos(lat0) * Math.cos(lon0 - rot) < -.25) return;
+  ctx.beginPath();
+  for (let k = 0; k <= 20; k++) {
+    const a = k / 20 * TAU, wob = 1 + .25 * Math.sin(a * 3 + lon0 * 5), lo = lon0 + Math.cos(a) * sz * wob * stretch - rot, la = lat0 + Math.sin(a) * sz * .8 * wob;
+    let px = Math.cos(la) * Math.sin(lo), py = -Math.sin(la);
+    if (Math.cos(la) * Math.cos(lo) < 0) { const m = Math.hypot(px, py) || 1; px /= m; py /= m; }
+    k ? ctx.lineTo(x + px * r, y + py * r) : ctx.moveTo(x + px * r, y + py * r);
+  }
+  ctx.fill();
+}
+function drawEarth(x, y, r, T) {
+  additive(() => glow('#7cc8ff', x, y, r * 1.5, .6, true));
+  ctx.save(); ctx.beginPath(); ctx.arc(x, y, r, 0, TAU); ctx.clip();
+  const sg = ctx.createRadialGradient(x - r * .35, y - r * .35, r * .1, x, y, r); sg.addColorStop(0, '#62b4ff'); sg.addColorStop(1, '#1f55b8');
+  ctx.fillStyle = sg; ctx.fillRect(x - r, y - r, 2 * r, 2 * r);
+  ctx.fillStyle = '#4cc36a'; for (const [lo, la, sz] of CONT) blob(x, y, r, lo, la, sz, T * .5, 1);
+  ctx.fillStyle = '#2e9e4f'; for (const [lo, la, sz] of CONT) blob(x, y, r, lo + .08, la - .06, sz * .45, T * .5, 1);
+  ctx.fillStyle = 'rgba(255,255,255,.85)'; for (const [lo, la, sz] of CLOUD) blob(x, y, r, lo, la, sz * .5, T * .8, 2.2);
+  const sh = ctx.createRadialGradient(x - r * .5, y - r * .5, r * .4, x - r * .2, y - r * .2, r * 1.5);
+  sh.addColorStop(0, 'rgba(0,10,40,0)'); sh.addColorStop(1, 'rgba(0,10,40,.55)'); ctx.fillStyle = sh; ctx.fillRect(x - r, y - r, 2 * r, 2 * r);
+  ctx.restore();
+  ctx.strokeStyle = INK; ctx.lineWidth = 2.5; ctx.beginPath(); sellipse(x, y, r, r, 130, .015); ctx.stroke();
+  ctx.fillStyle = 'rgba(255,255,255,.35)'; ctx.beginPath(); ctx.ellipse(x - r * .45, y - r * .5, r * .18, r * .09, -.6, 0, TAU); ctx.fill();
+}
+const MOON = { cy: 1930, R: 1410 };
+const CRATERS = Array.from({ length: 34 }, (_, i) => ({ phi: (hash(i * 3.3) - .5) * 1.5, d: 12 + hash(i * 4.4) ** 1.3 * 190, s: 8 + hash(i * 5.5) ** 2 * 38 }));
+function drawMoon(dy, scroll) {
+  const cy = MOON.cy + dy, top = cy - MOON.R; if (top > H) return;
+  ctx.save(); ctx.beginPath(); ctx.arc(640, cy, MOON.R, 0, TAU);
+  const g = ctx.createLinearGradient(0, top, 0, top + 230); g.addColorStop(0, '#cfcbc2'); g.addColorStop(1, '#8a877f');
+  ctx.fillStyle = g; ctx.fill(); ctx.clip();
+  for (const [k, c] of CRATERS.entries()) {
+    const phi = ((c.phi - scroll * (1 + c.d / 200) + .75) % 1.5 + 1.5) % 1.5 - .75, rr = MOON.R - c.d, fz = .28 + .5 * c.d / 200;
+    const x = 640 + rr * Math.sin(phi), y = cy - rr * Math.cos(phi);
+    if (x < -60 || x > W + 60) continue;
+    ctx.fillStyle = 'rgba(88,84,78,.6)'; ctx.beginPath(); ctx.ellipse(x, y, c.s, c.s * fz, 0, 0, TAU); ctx.fill();
+    ctx.strokeStyle = 'rgba(240,236,228,.65)'; ctx.lineWidth = 1.6; ctx.beginPath(); ctx.ellipse(x, y + 1.5, c.s, c.s * fz, 0, .15 * Math.PI, .85 * Math.PI); ctx.stroke();
+    ctx.strokeStyle = 'rgba(42,36,32,.55)'; ctx.lineWidth = 1.2; ctx.beginPath(); sellipse(x, y, c.s, c.s * fz, 140 + k, .05, 1); ctx.stroke();
+  }
+  ctx.restore();
+  ctx.strokeStyle = 'rgba(240,236,228,.7)'; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(640, cy, MOON.R, Math.PI * 1.25, Math.PI * 1.75); ctx.stroke();
+}
+function warpLines(t, a) {              // hyperspace streaks radiating from the centre
+  if (a <= 0) return;
+  additive(() => {
+    ctx.lineCap = 'round';
+    for (let k = 0; k < 160; k++) {
+      const ang = hash(k * 1.3) * TAU, d = (hash(k * 2.1) + t * (.6 + t)) % 1, r0 = 20 + 900 * d * d, r1 = r0 * (1.08 + .5 * t);
+      ctx.strokeStyle = ['#ffffff', '#9fe3ff', '#ffd27a', '#ff9fd8'][k % 4]; ctx.globalAlpha = a * d; ctx.lineWidth = 1 + 2 * d;
+      ctx.beginPath(); ctx.moveTo(640 + Math.cos(ang) * r0, 360 + Math.sin(ang) * r0); ctx.lineTo(640 + Math.cos(ang) * r1, 360 + Math.sin(ang) * r1); ctx.stroke();
+    }
+  });
+}
+const TUNNEL = (() => {                 // kaleidoscopic Kali-fractal tunnel, rendered small and scaled up
+  const c = mk(640, 360), gl = c.getContext('webgl', { preserveDrawingBuffer: true });
+  if (!gl) return null;
+  const sh = (type, src) => { const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s); return s; };
+  const pr = gl.createProgram();
+  gl.attachShader(pr, sh(gl.VERTEX_SHADER, 'attribute vec2 p;void main(){gl_Position=vec4(p,0.,1.);}'));
+  gl.attachShader(pr, sh(gl.FRAGMENT_SHADER, `precision highp float;
+uniform vec2 R; uniform float T, P, K;
+vec3 pal(float t){ return .5 + .5 * cos(6.2832 * (t + vec3(0., .33, .67))); }
+mat2 rot(float a){ float c = cos(a), s = sin(a); return mat2(c, -s, s, c); }
+void main(){
+  vec2 uv = (gl_FragCoord.xy - .5 * R) / R.y;
+  float r = length(uv), a = atan(uv.y, uv.x) + T * .3, lr = log(r);
+  vec2 p = vec2(a * 2. / 3.14159, lr * 1.5 - T * 2.);   // log-polar: moving in log r = flying forward
+  p = abs(fract(p * .5) * 2. - 1.);                      // mirrored tiles, seamless all round
+  float trap = 9., sc = 1.;
+  for (int i = 0; i < 6; i++) {                          // kaleidoscopic IFS folds
+    p = abs(p) - vec2(.5, .36);
+    p *= rot(.62 + .2 * sin(T * .5));
+    p *= 1.42; sc *= 1.42;
+    trap = min(trap, abs(p.y) / sc);
+  }
+  float line = .006 / (trap + .003);
+  vec3 col = pal(trap * 14. + lr * .6 - T * .4) * (.1 + 1.3 * line) * (1. + .7 * P);
+  col = mix(vec3(dot(col, vec3(.3, .5, .2))) * vec3(.35, .7, 1.2), col, K);   // K: earth-blue -> full colour
+  col *= smoothstep(.03, .3, r) * .8 + .2;
+  col = mix(col, vec3(1., .97, .9), smoothstep(.14, .025, r));               // light at the end = paper
+  gl_FragColor = vec4(col, 1.);
+}`));
+  gl.linkProgram(pr);
+  if (!gl.getProgramParameter(pr, gl.LINK_STATUS)) { console.warn(gl.getProgramInfoLog(pr)); return null; }
+  gl.useProgram(pr);
+  gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer()); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+  const loc = gl.getAttribLocation(pr, 'p'); gl.enableVertexAttribArray(loc); gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+  const U = n => gl.getUniformLocation(pr, n);
+  gl.viewport(0, 0, 640, 360); gl.uniform2f(U('R'), 640, 360);
+  return { c, draw(t, pulse, k) { gl.uniform1f(U('T'), t); gl.uniform1f(U('P'), pulse); gl.uniform1f(U('K'), k); gl.drawArrays(gl.TRIANGLES, 0, 3); } };
+})();
+
+// ---------- neuron: a seeded branching dendrite tree + an axon ----------
+const NEURON = (() => {
+  const R = rng(42), segs = [], tips = [];
+  const grow = (x, y, a, len, w, depth, dist, parent) => {
+    const n = 3 + (R() * 3 | 0), l = len / n;
+    for (let k = 0; k < n; k++) {
+      a += (R() - .5) * .5;
+      const nx = x + Math.cos(a) * l, ny = y + Math.sin(a) * l;
+      segs.push({ x1: x, y1: y, x2: nx, y2: ny, w: w * (1 - .35 * k / n), d0: dist, d1: dist + l, depth, parent });
+      parent = segs.length - 1; x = nx; y = ny; dist += l;
+    }
+    if (depth < 3) { const kids = depth ? 2 : 3; for (let c = 0; c < kids; c++) grow(x, y, a + (c - (kids - 1) / 2) * (.6 + R() * .35), len * (.58 + R() * .2), w * .62, depth + 1, dist, parent); }
+    else tips.push(parent);
+  };
+  for (let i = 0; i < 7; i++) { const a = (i + .5) / 7 * TAU + (R() - .5) * .45; grow(Math.cos(a) * 24, Math.sin(a) * 24, a, 110 + R() * 70, 6.5, 0, 0, -1); }
+  const maxD = segs.reduce((m, s) => Math.max(m, s.d1), 0);
+  const paths = tips.filter((_, i) => i % 2 === 0).map(t => { const p = []; for (let j = t; j >= 0; j = segs[j].parent) p.push(segs[j]); return p; });
+  const axon = Array.from({ length: 26 }, (_, k) => [-26 - k * 24, 6 + k * 2.2 + 12 * Math.sin(k * .7)]);
+  return { segs, maxD, paths, axon };
+})();
+function drawNeuron(zoom, D, style) {
+  ctx.save(); ctx.translate(FX, FY); ctx.scale(zoom, zoom); ctx.lineCap = 'round';
+  for (let dep = 0; dep < 4; dep++) {
+    let wsum = 0, n = 0; ctx.beginPath();
+    for (const s of NEURON.segs) {
+      if (s.depth !== dep || s.d0 >= D) continue;
+      const f = Math.min(1, (D - s.d0) / (s.d1 - s.d0)), x2 = lerp(s.x1, s.x2, f), y2 = lerp(s.y1, s.y2, f);
+      if (style === 'pencil') sline(s.x1, s.y1, x2, y2, .7, n, 1); else { ctx.moveTo(s.x1, s.y1); ctx.lineTo(x2, y2); }
+      wsum += s.w; n++;
+    }
+    if (!n) continue;
+    const w = wsum / n;
+    if (style === 'pencil') { ctx.strokeStyle = INK; ctx.globalAlpha = .85; ctx.lineWidth = Math.max(1, w * .6); ctx.stroke(); continue; }
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.strokeStyle = '#1f5fd6'; ctx.globalAlpha = .22; ctx.lineWidth = w * 3.4; ctx.stroke();
+    ctx.strokeStyle = '#5fb4ff'; ctx.globalAlpha = .9; ctx.lineWidth = w; ctx.stroke();
+    ctx.strokeStyle = '#d9f4ff'; ctx.globalAlpha = .5; ctx.lineWidth = w * .35; ctx.stroke();
+    ctx.globalCompositeOperation = 'source-over';
+  }
+  ctx.restore();
+}
+function glowLine(pts, w, col, a = 1) {
+  if (pts.length < 2) return;
+  ctx.save(); ctx.globalCompositeOperation = 'lighter'; ctx.lineCap = ctx.lineJoin = 'round';
+  ctx.beginPath(); pts.forEach(([x, y], k) => k ? ctx.lineTo(x, y) : ctx.moveTo(x, y));
+  ctx.strokeStyle = col; ctx.globalAlpha = .12 * a; ctx.lineWidth = w * 5; ctx.stroke();
+  ctx.globalAlpha = .3 * a; ctx.lineWidth = w * 2; ctx.stroke();
+  ctx.strokeStyle = '#ffffff'; ctx.globalAlpha = Math.min(1, .9 * a); ctx.lineWidth = w * .6; ctx.stroke();
+  ctx.restore();
+}
+
+// ---------- prism + spectrum (the spectrum is a ribbon of vertical slices so it can twist into DNA) ----------
+const PRISM = { A: [640, 250], B: [495, 500], C: [785, 500] };
+const E1 = [560.25, 387.5], E2 = [724, 395], BEAM0 = [-20, 473];
+function triPoint(u) { const P = [PRISM.A, PRISM.C, PRISM.B, PRISM.A], k = Math.min(2, u * 3 | 0), f = u * 3 - k; return [lerp(P[k][0], P[k + 1][0], f), lerp(P[k][1], P[k + 1][1], f)]; }
+function drawPrism(depth, yaw, pitch, a) {
+  const G = [640, 416.7], F = 900, P = [];
+  for (const z of [0, depth]) for (const [x0, y0] of [PRISM.A, PRISM.C, PRISM.B]) {
+    let X = x0 - G[0], Y = y0 - G[1], Z = z - depth / 2;
+    [X, Z] = [X * Math.cos(yaw) + Z * Math.sin(yaw), -X * Math.sin(yaw) + Z * Math.cos(yaw)];
+    [Y, Z] = [Y * Math.cos(pitch) - Z * Math.sin(pitch), Y * Math.sin(pitch) + Z * Math.cos(pitch)];
+    const k = F / (F + Z + depth / 2); P.push([G[0] + X * k, G[1] + Y * k, Z]);
+  }
+  const faces = [[3, 4, 5], [0, 1, 4, 3], [1, 2, 5, 4], [2, 0, 3, 5], [0, 1, 2]]
+    .map(f => ({ f, z: f.reduce((s, i) => s + P[i][2], 0) / f.length })).sort((p, q) => q.z - p.z);
+  ctx.lineJoin = 'round';
+  for (const { f } of faces) {
+    ctx.beginPath(); f.forEach((i, k) => k ? ctx.lineTo(P[i][0], P[i][1]) : ctx.moveTo(P[i][0], P[i][1])); ctx.closePath();
+    ctx.fillStyle = `rgba(215,228,255,${.06 * a})`; ctx.fill();
+    ctx.strokeStyle = `rgba(255,255,255,${(f.length === 3 && f[0] === 0 ? .85 : .35) * a})`; ctx.lineWidth = 1.5; ctx.stroke();
+  }
+  additive(() => glow('#ffffff', P[0][0], P[0][1], 10, .6 * a));   // glint on the apex
+}
+const RB = ['#e8413a', '#f28c28', '#f6d83b', '#4cb85c', '#3b82d6', '#7b4fc9'];
+const NSL = 144, TW = TAU / 330, FANT = [Math.tan(.105), Math.tan(.377)];  // spectrum edges: 6 .. 21.6 deg below horizontal
+function ribbonGeom(T, e) {             // e = 0: prism fan, e = 1: full-width twisting ribbon
+  const g = [];
+  for (let i = 0; i <= NSL; i++) {
+    const X = -20 + i * 1320 / NSL, xf = E2[0] + (X + 20) / 1320 * 556, dx = xf - E2[0];
+    const ph = X * TW - T * TAU * .7, c = Math.cos(ph);
+    g.push({ x: lerp(xf, X, e), c: lerp(E2[1] + dx * (FANT[0] + FANT[1]) / 2, 360, e), h: lerp(dx * (FANT[1] - FANT[0]) / 2, 85 * c, e), sh: lerp(1, (.5 + .5 * Math.abs(c)) * (c < 0 ? .7 : 1), e), ph });
+  }
+  return g;
+}
+function drawRibbon(g, rung = 0, alpha = 1, growX = null, cut = -1e9) {   // rung: continuous ribbon -> every 3rd slice as a DNA rung
+  for (let pass = 0; pass < 2; pass++) {                                     // pass 0: soft glow, pass 1: pigment
+    ctx.globalCompositeOperation = pass ? 'source-over' : 'lighter';
+    for (let j = 0; j < 6; j++) {
+      ctx.fillStyle = RB[j]; const lim = growX ? growX(j) : 1e9;
+      for (let i = 0; i < NSL; i++) {
+        const p = g[i], q = g[i + 1], isR = i % 3 === 0, xc = (p.x + q.x) / 2;
+        if (xc > lim || xc < cut) continue;
+        const a = alpha * p.sh * (isR ? 1 : 1 - rung); if (a < .01) continue;
+        const sw = q.x - p.x + .7, w = isR ? lerp(sw, 6, rung) : sw;
+        const y0 = p.c + p.h * (-1 + j / 3), y1 = p.c + p.h * (-1 + (j + 1) / 3), pd = pass ? 0 : 5;
+        ctx.globalAlpha = Math.min(1, pass ? a : a * .18);
+        ctx.fillRect(xc - w / 2, Math.min(y0, y1) - pd, w, Math.abs(y1 - y0) + .6 + 2 * pd);
+      }
+    }
+  }
+  ctx.globalCompositeOperation = 'source-over'; ctx.globalAlpha = 1;
+}
+function strands(g, cut, front, a) {    // DNA backbones = the ribbon's two edges; depth decides front/back
+  if (a <= 0) return;
+  ctx.save(); ctx.lineCap = 'round';
+  for (const v of [-1, 1]) {
+    ctx.beginPath();
+    for (let i = 0; i < NSL; i++) {
+      const p = g[i], q = g[i + 1];
+      if ((p.x + q.x) / 2 < cut || (v * Math.sin(p.ph) > 0) !== front) continue;
+      ctx.moveTo(p.x, p.c + p.h * v); ctx.lineTo(q.x, q.c + q.h * v);
+    }
+    ctx.globalCompositeOperation = 'lighter'; ctx.strokeStyle = '#9ec9ff'; ctx.globalAlpha = .18 * a; ctx.lineWidth = front ? 12 : 8; ctx.stroke();
+    ctx.globalCompositeOperation = 'source-over'; ctx.strokeStyle = '#f7f1e3'; ctx.globalAlpha = (front ? .95 : .4) * a; ctx.lineWidth = front ? 4.5 : 2.5; ctx.stroke();
+  }
+  ctx.restore();
+}
+
+// ---------- 864 dots: DNA rungs -> spiral -> sunflower seeds -> birds -> accretion disk -> comet ----------
+const NP = 864, GOLD = Math.PI * (3 - Math.sqrt(5)), RMAX = 5.3 * Math.sqrt(NP);
+const T_A = (SC.dna.b0 + 2.3) * BEAT, T_B = (SC.sunflower.b0 + 1.2) * BEAT;   // divergence sweep -> golden angle lock
+const spiralRot = T => T < T_B ? .5 * T : .5 * T_B + .06 * (T - T_B);
+const spiralAlpha = T => lerp(TAU * .376, GOLD, eout(inv(T_A, T_B, T)));
+function spiral(i, T) { const r = 5.3 * Math.sqrt(i + .6), th = i * spiralAlpha(T) + spiralRot(T); return [640 + r * Math.cos(th), 360 + r * Math.sin(th)]; }
+const DNA_P = Array.from({ length: NP }, (_, i) => {   // each dot starts on one rung segment (left rungs -> spiral centre)
+  const r = i / 18 | 0, j = (i % 18) / 3 | 0, m = i % 3, Xl = -20 + r * 3 * 1320 / NSL;
+  const br = 2.3 + .9 * (Xl + 1320 / NSL / 2 + 40) / 1360, Tr = (SC.dna.b0 + br) * BEAT, v = -1 + (j + (m + .5) / 3) / 3;
+  return { x: Xl + 1320 / NSL / 2, y: 360 + 85 * Math.cos(Xl * TW - Tr * TAU * .7) * v, br, col: RB[j], sw: .5 + .5 * hash(i * 2.9) };
+});
+function seedXY(i, beatAbs, T) {        // null until the dot's rung dissolves
+  const p = DNA_P[i], bl = beatAbs - SC.dna.b0; if (bl < p.br) return null;
+  const u = eio(inv(p.br, p.br + 1.1, bl)), [tx, ty] = spiral(i, T), dx = tx - p.x, dy = ty - p.y, sw = Math.sin(Math.PI * u) * .4 * p.sw;
+  return [lerp(p.x, tx, u) - dy * sw, lerp(p.y, ty, u) + dx * sw];
+}
+const SEEDCOL = ['#b8a53c', '#6b4222', '#86572c', '#a06c35'];
+const seedTone = i => i < 70 ? 0 : 1 + (hash(i * 1.3) * 3 | 0);
+function drawSeeds(beatAbs, T, k) {     // k: 0 = glowing rainbow dots, 1 = sunflower seeds
+  const P = [];
+  for (let i = 0; i < NP; i++) { const p = seedXY(i, beatAbs, T); if (p) P.push([i, p[0], p[1]]); }
+  if (k < 1) additive(() => { for (const [i, x, y] of P) glow(DNA_P[i].col, x, y, 6.5, .95 * (1 - k)); });
+  if (k <= 0) return;
+  ctx.globalAlpha = k;
+  for (let c = 0; c < 4; c++) {
+    ctx.fillStyle = SEEDCOL[c]; ctx.beginPath();
+    for (const [i, x, y] of P) { if (seedTone(i) !== c) continue; const r = 1.7 + 2.3 * Math.sqrt(i / NP); ctx.moveTo(x + r, y); ctx.arc(x, y, r, 0, TAU); }
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+function warmBG(a = 1) {
+  const g = ctx.createRadialGradient(640, 360, 40, 640, 360, 820);
+  g.addColorStop(0, '#ffd89c'); g.addColorStop(.45, '#ffab7c'); g.addColorStop(1, '#ee7f9e');
+  ctx.globalAlpha = a; ctx.fillStyle = g; ctx.fillRect(0, 0, W, H); ctx.globalAlpha = 1;
+}
+function petal(x, y, ang, len, wid, s, id, a = 1, fill = '#ffc53a') {
+  if (s <= .01 || a <= .01) return;
+  ctx.save(); ctx.translate(x, y); ctx.rotate(ang); ctx.scale(s, s); ctx.globalAlpha = a;
+  const wj = wid * (1 + jit(id, .06)), lj = len * (1 + jit(id + 1, .03)), tip = jit(id + 2, 2);
+  const shape = () => { ctx.beginPath(); ctx.moveTo(0, 0); ctx.quadraticCurveTo(lj * .45, -wj, lj, tip); ctx.quadraticCurveTo(lj * .45, wj, 0, 0); };
+  ctx.translate(1.5, 1.2); shape(); ctx.fillStyle = fill; ctx.fill(); ctx.translate(-1.5, -1.2);   // misregistered fill
+  shape(); ctx.strokeStyle = '#b8730f'; ctx.lineWidth = 1.5; ctx.stroke();
+  ctx.beginPath(); sline(6, 0, lj * .78, 0, .8, id + 3, 1); ctx.strokeStyle = 'rgba(184,115,15,.55)'; ctx.lineWidth = 1; ctx.stroke();
+  ctx.restore();
+}
+function drawSunflower(bb, T, sway, fly = -1) {    // bb = beat within the sunflower scene; fly >= 0 once the wind takes it
+  const rot = spiralRot(T), head = inv(.9, 1.5, bb) * (fly < 0 ? 1 : 1 - inv(.2, 1.4, fly));
+  for (const [n, r0, len, wid, t0, span, col] of [[21, 150, 120, 30, 1.1, 1.3, '#ffc53a'], [13, 142, 92, 27, 1.5, 1.1, '#ffae2c']]) {
+    for (let k = 0; k < n; k++) {
+      const bk = t0 + span * k / n, s = eback(inv(bk, bk + .5, bb));
+      let a = rot + (k + (n === 13 ? .5 : 0)) / n * TAU + sway * .07 * Math.sin(T * 9 + k), x = 640 + Math.cos(a) * r0, y = 360 + Math.sin(a) * r0, al = 1;
+      if (fly >= 0) {
+        const d = hash(k * 3.1 + n) * .6, f = Math.max(0, fly - d) * BEAT;
+        x += 380 * f * f + 60 * f; y += -140 * f + 30 * Math.sin(f * 7 + k); a += f * (2 + hash(k) * 3); al = 1 - inv(.3, 1.6, fly - d);
+      }
+      petal(x, y, a, len, wid, s, n * 10 + k, al, col);
+    }
+  }
+  if (head > 0) {
+    ctx.globalAlpha = head; ctx.fillStyle = '#1c0f07'; ctx.beginPath(); ctx.arc(640, 360, RMAX + 8, 0, TAU); ctx.fill();
+    ctx.strokeStyle = INK; ctx.lineWidth = 2; ctx.beginPath(); sellipse(640, 360, RMAX + 9, RMAX + 9, 95, .02); ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
+}
+function post() {                        // print-on-paper finish: paper multiply + boiling grain
+  ctx.save();
+  ctx.globalCompositeOperation = 'multiply'; ctx.globalAlpha = .3; ctx.drawImage(PAPER, 0, 0);
+  ctx.globalCompositeOperation = 'overlay'; ctx.globalAlpha = .2;
+  const ox = hash(BOIL) * 256, oy = hash(BOIL + 7) * 256;
+  ctx.translate(-ox, -oy); ctx.fillStyle = GRAIN; ctx.fillRect(0, 0, W + 256, H + 256);
+  ctx.restore();
+}
+function render(T) {
+  const beat = T / BEAT; BOIL = Math.floor(T * 12);
+  let k = 0; while (k < S.length - 1 && beat >= S[k].b1) k++;
+  const s = S[k];
+  ctx.save(); DRAW[s.id](beat - s.b0, s, T); ctx.restore();
+  post();
+}
+
+// =====================================================================
+//  AUDIO - procedural instruments on one Web Audio graph
+// =====================================================================
+let AC = null, MASTER = null, RECDEST = null, SES = null;
+function initAudio() {
+  if (AC) { AC.resume(); return; }
+  AC = new (window.AudioContext || window.webkitAudioContext)();
+  MASTER = masterChain(AC, AC.destination);
+  RECDEST = AC.createMediaStreamDestination(); MASTER.out.connect(RECDEST);
+  AC.resume();
+}
+function masterChain(ac, dest) {
+  const comp = ac.createDynamicsCompressor(), out = ac.createGain();
+  comp.threshold.value = -14; comp.knee.value = 12; comp.ratio.value = 3; comp.attack.value = .008; comp.release.value = .3;
+  out.gain.value = 1.1; comp.connect(out); out.connect(dest);
+  return { in: comp, out };
+}
+function impulse(ac) {                   // procedural hall: decaying noise that darkens over time
+  if (ac._ir) return ac._ir;
+  const sr = ac.sampleRate, len = sr * 3.2 | 0, buf = ac.createBuffer(2, len, sr), R = rng(3);
+  for (let ch = 0; ch < 2; ch++) {
+    const d = buf.getChannelData(ch); let lp = 0;
+    for (let i = 0; i < len; i++) {
+      const t = i / sr, k = .12 + .8 * Math.exp(-t / .5);
+      lp += k * (R() * 2 - 1 - lp);
+      d[i] = t < .012 ? 0 : lp * Math.exp(-t / .48);
+    }
+  }
+  return ac._ir = buf;
+}
+function noiseBuf(ac) {
+  if (ac._nz) return ac._nz;
+  const len = ac.sampleRate * 2, b = ac.createBuffer(1, len, ac.sampleRate), d = b.getChannelData(0), R = rng(9);
+  for (let i = 0; i < len; i++) d[i] = R() * 2 - 1;
+  return ac._nz = b;
+}
+function makeSession(ac, dest) {         // one disposable mix per play/seek: buses -> hall reverb + dotted-8th echo
+  const g = v => { const n = ac.createGain(); n.gain.value = v; return n; };
+  const out = g(1); out.connect(dest);
+  const rv = ac.createConvolver(); rv.buffer = impulse(ac); rv.connect(out);
+  const dl = ac.createDelay(2), fb = g(.32), damp = ac.createBiquadFilter();
+  dl.delayTime.value = BEAT * .75; damp.type = 'lowpass'; damp.frequency.value = 2600;
+  dl.connect(damp); damp.connect(fb); fb.connect(dl); damp.connect(out); damp.connect(g(.35)).connect(rv);
+  const bus = (dry, wet, echo) => { const i = g(1); i.connect(g(dry)).connect(out); i.connect(g(wet)).connect(rv); if (echo) i.connect(g(echo)).connect(dl); return i; };
+  return { ac, out, pluck: bus(.8, .32, .2), bell: bus(.5, .55, .3), mar: bus(.8, .28, .12), pad: bus(.5, .7, 0), bass: bus(.95, .1, 0), drum: bus(.9, .16, 0), fx: bus(.6, .6, .08) };
+}
+function voice(bus, pan = 0, vol = 1) {
+  const ac = SES.ac, g = ac.createGain(), p = ac.createStereoPanner();
+  g.gain.value = vol; p.pan.value = clamp(pan, -1, 1); g.connect(p); p.connect(SES[bus]); return g;
+}
+function ksNote(ac, m) {                 // Karplus-Strong plucked string, rendered once per note
+  const cache = ac._ks || (ac._ks = new Map()); if (cache.has(m)) return cache.get(m);
+  const sr = ac.sampleRate, f = mtof(m), P = Math.max(4, Math.round(sr / f + .5)), fg = sr / (P - .5);
+  const t60 = m < 48 ? 2.4 : m < 72 ? 1.7 : 1.1, len = sr * Math.min(3, t60 * 1.15) | 0;
+  const rho = Math.exp(-6.9 / (t60 * fg)), buf = ac.createBuffer(1, len, sr), d = buf.getChannelData(0);
+  const R = rng(m * 7 + 1), ex = new Float32Array(P), line = new Float32Array(P), soft = m < 48 ? .28 : .5;
+  let lp = 0, mean = 0;
+  for (let i = 0; i < P; i++) { lp += soft * (R() * 2 - 1 - lp); ex[i] = lp; mean += lp / P; }
+  const q = Math.max(1, Math.round(P * .17));                   // pluck position comb
+  for (let i = 0; i < P; i++) line[i] = (ex[i] - mean) - .85 * (ex[(i + q) % P] - mean);
+  let j = 0, pk = 1e-6;
+  for (let n = 0; n < len; n++) {
+    const a = line[j], nb = line[j + 1 === P ? 0 : j + 1];
+    d[n] = a; line[j] = rho * .5 * (a + nb); if (++j === P) j = 0;
+    if (a > pk) pk = a; else if (-a > pk) pk = -a;
+  }
+  const gn = .7 / pk, fade = sr * .15 | 0;
+  for (let n = 0; n < len; n++) d[n] *= gn * (n > len - fade ? (len - n) / fade : 1);
+  const v = { buf, rate: f / fg }; cache.set(m, v); return v;
+}
+function pluck(w, m, vel = .5, pan = 0, bus = 'pluck', len = 0) {
+  const ac = SES.ac, k = ksNote(ac, m), s = ac.createBufferSource(), g = voice(bus, pan, vel);
+  s.buffer = k.buf; s.playbackRate.value = k.rate; s.connect(g); s.start(w);
+  if (len) { g.gain.setValueAtTime(vel, w + len); g.gain.setTargetAtTime(0, w + len, .07); s.stop(w + len + .5); }
+}
+function partials(w, bus, pan, vel, f, list) {   // [ratio, amp, decay] sine partials (mallets, bells)
+  const ac = SES.ac, out = voice(bus, pan, vel);
+  for (const [r, a, d] of list) {
+    if (f * r > 15000) continue;
+    const o = ac.createOscillator(), g = ac.createGain(); o.frequency.value = f * r;
+    g.gain.setValueAtTime(0, w); g.gain.linearRampToValueAtTime(a, w + .003); g.gain.exponentialRampToValueAtTime(.0004, w + d);
+    o.connect(g); g.connect(out); o.start(w); o.stop(w + d + .05);
+  }
+  return out;
+}
+const bell = (w, m, vel = .3, pan = 0) => partials(w, 'bell', pan, vel, mtof(m), [[1, 1, 1.8], [2.756, .36, .55], [5.404, .13, .2]]);
+function marimba(w, m, vel = .4, pan = 0) {
+  const T = clamp(1.1 - (m - 55) * .025, .25, 1.1);
+  const out = partials(w, 'mar', pan, vel, mtof(m), [[1, 1, T], [3.93, .2, T * .22], [9.2, .05, T * .07]]);
+  noiseHit(w, 'mar', mtof(m) * 2, 'bandpass', .02, vel * .5, pan, 2, .001);
+  return out;
+}
+function tone(w, f, dec, vel, bus = 'fx', type = 'sine', f1 = f, pan = 0, att = .005) {
+  const ac = SES.ac, o = ac.createOscillator(), g = voice(bus, pan, 0); o.type = type;
+  o.frequency.setValueAtTime(f, w); if (f1 !== f) o.frequency.exponentialRampToValueAtTime(f1, w + dec);
+  g.gain.setValueAtTime(0, w); g.gain.linearRampToValueAtTime(vel, w + att); g.gain.exponentialRampToValueAtTime(.0005, w + att + dec);
+  o.connect(g); o.start(w); o.stop(w + att + dec + .05);
+}
+function noiseHit(w, bus, freq, type = 'bandpass', dec = .1, vel = .3, pan = 0, q = .8, att = .002) {
+  const ac = SES.ac, n = ac.createBufferSource(), f = ac.createBiquadFilter(), g = voice(bus, pan, 0);
+  n.buffer = noiseBuf(ac); n.loop = true; f.type = type; f.frequency.value = freq; f.Q.value = q;
+  g.gain.setValueAtTime(0, w); g.gain.linearRampToValueAtTime(vel, w + att); g.gain.exponentialRampToValueAtTime(.0005, w + att + dec);
+  n.connect(f); f.connect(g); n.start(w, hash(w * 13) * 1.5, att + dec + .05);
+}
+function pad(w, notes, dur, vel = .1, cut = 1300, att = .8, rel = 1.6) {   // detuned-saw string pad
+  const ac = SES.ac, f = ac.createBiquadFilter(), g = ac.createGain(), end = w + dur;
+  f.type = 'lowpass'; f.Q.value = .5;
+  f.frequency.setValueAtTime(cut * .35, w); f.frequency.linearRampToValueAtTime(cut, w + att * 1.5); f.frequency.setTargetAtTime(cut * .6, w + att * 1.5, dur);
+  g.gain.setValueAtTime(0, w); g.gain.linearRampToValueAtTime(vel, w + att); g.gain.setValueAtTime(vel, end); g.gain.setTargetAtTime(0, end, rel / 4);
+  f.connect(g); g.connect(SES.pad);
+  notes.forEach((m, i) => {
+    const p = ac.createStereoPanner(); p.pan.value = (i / (notes.length - 1 || 1) - .5) * .8; p.connect(f);
+    for (const det of [-7, 7]) {
+      const o = ac.createOscillator(), og = ac.createGain();
+      o.type = 'sawtooth'; o.frequency.value = mtof(m); o.detune.value = det + (hash(m + det) - .5) * 4;
+      og.gain.value = .5 / notes.length; o.connect(og); og.connect(p); o.start(w); o.stop(end + rel * 1.5);
+    }
+  });
+}
+function bass(w, m, dur, vel = .5) {                  // plucked string + sine sub
+  pluck(w, m, vel * .8, 0, 'bass', dur);
+  const ac = SES.ac, o = ac.createOscillator(), g = voice('bass', 0, 0);
+  o.frequency.value = mtof(m);
+  g.gain.setValueAtTime(0, w); g.gain.linearRampToValueAtTime(vel * .45, w + .012); g.gain.setTargetAtTime(vel * .25, w + .02, .2); g.gain.setTargetAtTime(0, w + dur, .06);
+  o.connect(g); o.start(w); o.stop(w + dur + .5);
+}
+function kick(w, vel = .7) {                          // soft felt kick
+  const ac = SES.ac, o = ac.createOscillator(), g = voice('drum', 0, 0);
+  o.frequency.setValueAtTime(115, w); o.frequency.exponentialRampToValueAtTime(42, w + .13);
+  g.gain.setValueAtTime(0, w); g.gain.linearRampToValueAtTime(vel, w + .004); g.gain.exponentialRampToValueAtTime(.001, w + .5);
+  o.connect(g); o.start(w); o.stop(w + .55);
+  noiseHit(w, 'drum', 2500, 'lowpass', .012, vel * .12);
+}
+const snare = (w, v = .35, p = 0) => { noiseHit(w, 'drum', 2200, 'bandpass', .18, v, p, .7); tone(w, 190, .07, v * .35, 'drum'); };
+const hat = (w, v = .12, p = .25, open = 0) => noiseHit(w, 'drum', 8000, 'highpass', open ? .22 : .035, v, p, .7);
+const shaker = (w, v = .1, p = -.25) => noiseHit(w, 'drum', 5500, 'bandpass', .06, v, p, 1.2, .012);
+function swell(w, dur, vel = .3, f0 = 400, f1 = 7000, pan = 0) {      // reverse-cymbal style riser
+  const ac = SES.ac, n = ac.createBufferSource(), f = ac.createBiquadFilter(), g = voice('fx', pan, 0);
+  n.buffer = noiseBuf(ac); n.loop = true; f.type = 'bandpass'; f.Q.value = 1.2;
+  f.frequency.setValueAtTime(f0, w); f.frequency.exponentialRampToValueAtTime(f1, w + dur);
+  g.gain.setValueAtTime(.0001, w); g.gain.exponentialRampToValueAtTime(vel, w + dur); g.gain.setTargetAtTime(0, w + dur, .03);
+  n.connect(f); f.connect(g); n.start(w); n.stop(w + dur + .3);
+}
+function whoosh(w, dur, vel = .25, p0 = -.8, p1 = .8, f0 = 400, f1 = 2400) {   // band-passed air moving across the stereo field
+  const ac = SES.ac, n = ac.createBufferSource(), f = ac.createBiquadFilter(), g = ac.createGain(), p = ac.createStereoPanner();
+  n.buffer = noiseBuf(ac); n.loop = true; f.type = 'bandpass'; f.Q.value = 1.4;
+  f.frequency.setValueAtTime(f0, w); f.frequency.exponentialRampToValueAtTime(f1, w + dur * .6); f.frequency.exponentialRampToValueAtTime(f0 * 1.5, w + dur);
+  g.gain.setValueAtTime(0, w); g.gain.linearRampToValueAtTime(vel, w + dur * .55); g.gain.linearRampToValueAtTime(0, w + dur);
+  p.pan.setValueAtTime(p0, w); p.pan.linearRampToValueAtTime(p1, w + dur);
+  n.connect(f); f.connect(g); g.connect(p); p.connect(SES.fx); n.start(w, hash(w) * 1.5); n.stop(w + dur + .05);
+}
+const boom = (w, v = .6) => { tone(w, 72, 1.4, v, 'fx', 'sine', 30); noiseHit(w, 'fx', 180, 'lowpass', .5, v * .45, 0, .5); };
+const crash = (w, v = .12) => noiseHit(w, 'fx', 6500, 'highpass', 1.8, v, 0, .5, .004);
+
+// ---------- the score: each scene books its own events relative to its first beat ----------
+const MUSIC = {
+  intro(s, at) {
+    const [b0, ...v] = s.chord, D = s.beats * BEAT;
+    at(0, (w, o = 0) => pad(w, v, D - o + .4, .09, 1100, 1.6), D);
+    at(0, w => tone(w, 1300, .6, .05, 'fx', 'sine', 420));                       // falling whistle
+    at(1, w => { kick(w, .55); tone(w, 170, .16, .3, 'drum', 'sine', 60); bass(w, b0, 3 * BEAT, .35); });  // landing thud
+    at(2, w => tone(w, 2100, .035, .06, 'fx'));                                   // blink tick
+    [74, 78, 81].forEach((m, i) => at(2.5 + i * .5, w => marimba(w, m, .35, .25)));   // wave: "hi!"
+    const arp = [62, 69, 76, 78, 81, 76, 73, 69];
+    arp.forEach((m, k) => at(1 + k * .5, w => pluck(w, m, k % 2 ? .2 : .27, (k % 4 - 1.5) * .25)));
+    [81, 78, 76, 74, 69].forEach((m, k) => at(s.beats - 1.75 + k * .3, w => bell(w, m, .12, k % 2 ? .45 : -.45)));  // ring pings
+    at(s.beats - 2, w => swell(w, 2 * BEAT, .22, 300, 6000));                              // swell into the flash
+  },
+  neuron(s, at) {
+    const [b0, ...v] = s.chord, D = s.beats * BEAT;
+    at(0, w => { boom(w, .55); crash(w, .12); [83, 86, 90, 93].forEach((m, i) => bell(w + i * .03, m, .1, i % 2 ? .5 : -.5)); bass(w, b0, D, .35); });
+    at(0, (w, o = 0) => pad(w, v, D - o + .4, .1, 1600, .3), D);
+    const pent = [71, 74, 76, 78, 81, 83, 86];                                     // synapse pings (B minor pentatonic)
+    [1, 1.5, 1.75, 2.5, 3.5, 3.75, 4.25].forEach((b, k) => at(b, w => pluck(w, pent[(k * 5 + 2) % 7], .16, hash(k) * 1.6 - .8)));
+    for (let k = 1; k <= s.beats - 2; k++) at(k, w => tone(w, 95, .22, .18, 'drum', 'sine', 50));  // soma pulse on each beat
+    at(3, w => { snare(w, .3); noiseHit(w, 'fx', 3500, 'highpass', .25, .06, .3); });   // pencil flash
+    at(s.beats - 1.5, w => { swell(w, 1.5 * BEAT, .18, 250, 4000); tone(w, 900, 1.2, .03, 'fx', 'sine', 220); });
+  },
+  prism(s, at) {
+    const [b0, ...v] = s.chord, D = s.beats * BEAT;
+    const heart = w => { kick(w, .5); kick(w + .19, .32); };                       // lub-dub
+    at(0, w => { heart(w); bass(w, b0, D, .4); bell(w, 88, .12, -.2); tone(w, 2637, 1.6, .025, 'bell', 'sine', 2637, .2, .3); });
+    at(0, (w, o = 0) => pad(w, v, D - o + .4, .1, 900, .5), D);
+    for (let k = 2; k < s.beats; k += 2) at(k, heart);
+    [76, 79, 83, 86, 88, 90].forEach((m, j) => at(.75 + .25 * j, w => bell(w, m, .14, -.5 + j * .2)));   // one note per colour band
+    [64, 67, 71, 74].forEach((m, k) => at(s.beats - 1 + k * .25, w => pluck(w, m, .2, -.3 + k * .2)));
+    at(s.beats - 1, w => swell(w, BEAT, .14, 500, 5000));
+  },
+  dna(s, at) {
+    const [b0, ...v] = s.chord, sus = v, dom = v.map(m => m === 62 ? 61 : m), h = s.beats / 2;   // A7sus4 -> A7 halfway
+    at(0, w => { kick(w, .55); bass(w, b0, h * BEAT, .4); pad(w, sus, h * BEAT + .1, .09, 1500, .25, .8); });
+    at(h, w => { kick(w, .5); bass(w, b0 + 12, h * BEAT, .32); pad(w, dom, h * BEAT + .2, .09, 1500, .2, 1.4); });
+    for (let k = 1; k < s.beats; k += 2) at(k, w => snare(w, .25));
+    for (let k = 0; k < 4 * s.beats; k++) at(k / 4, w => shaker(w, k % 2 ? .05 : .09));
+    const ost = [69, 74, 76, 79], ost2 = [69, 73, 76, 79];                      // plucks follow the helix twist L<->R
+    for (let k = 0; k < 10; k++) at(k / 4, w => pluck(w, (k < 8 ? ost : ost2)[k % 4], k % 4 ? .15 : .24, Math.sin(k * 1.1) * .7));
+    [93, 91, 88, 86, 85, 81, 79, 76].forEach((m, k) => at(2.3 + k * .22, w => bell(w, m, .11, .6 - k * .15)));   // dissolve sparkle
+  },
+  sunflower(s, at) {
+    const [b0, ...v] = s.chord, D = s.beats * BEAT;
+    at(0, w => { kick(w, .55); bass(w, b0, D, .4); });
+    at(0, (w, o = 0) => pad(w, v, D - o + .3, .1, 1700, .4), D);
+    at(1.2, w => { bell(w, 86, .16, 0); marimba(w, 50, .35, 0); });            // golden angle "click"
+    [62, 66, 69, 73, 74, 78, 81, 85].forEach((m, k) => at(1.25 + k * .25, w => marimba(w, m, .3, -.6 + k * .17)));   // petals bloom
+    for (let k = 1; k < s.beats; k++) at(k, w => k % 2 ? snare(w, .22) : kick(w, .45));
+    for (let k = 0; k < 2 * s.beats; k++) at(k / 2, w => shaker(w, .08));
+    at(s.beats - 1, w => whoosh(w, 1.4 * BEAT, .16, -.6, .7, 300, 1800));                 // wind picks up
+  },
+  flock(s, at) {
+    const [b0, ...v] = s.chord, D = s.beats * BEAT;
+    at(0, w => { whoosh(w, 1.6 * BEAT, .22, -.9, .9, 300, 3000); boom(w, .28); crash(w, .07); bass(w, b0 + 12, D, .38); });
+    at(0, (w, o = 0) => pad(w, v, D - o + .3, .1, 1800, .5), D);
+    [[.5, 74], [1, 78], [1.5, 81], [2, 83], [3, 81], [3.5, 78], [4, 76], [4.5, 74], [5, 71], [5.5, 69]]
+      .forEach(([b, m], k) => at(b, w => pluck(w, m, k === 3 ? .3 : .23, -.4 + .8 * hash(k))));  // melody drifting down with the flock
+    [0, 2.5, 4].forEach(b => at(b, w => kick(w, .45)));
+    [2, 5].forEach(b => at(b, w => snare(w, .22)));
+    for (let k = 0; k < 4 * s.beats; k++) at(k / 4, w => shaker(w, k % 4 === 2 ? .08 : .045));
+    at(2, w => whoosh(w, 1.2 * BEAT, .08, .7, -.7, 500, 2500));
+    at(3.5, w => whoosh(w, 1.2 * BEAT, .08, -.7, .7, 500, 2500));
+    at(s.beats - 2, w => swell(w, 2 * BEAT, .24, 200, 5000));                   // the flock condenses...
+  },
+  blackhole(s, at) {
+    const [b0, ...v] = s.chord, D = s.beats * BEAT;
+    at(0, w => { boom(w, .6); tone(w, 90, 2 * BEAT, .45, 'fx', 'sine', 28); bass(w, b0, 2.4 * BEAT, .4); });   // ...and ignites: sub drop
+    at(0, (w, o = 0) => pad(w, v, (s.beats - .7) * BEAT - o, .1, 800, .2, 1), (s.beats - .7) * BEAT);
+    at(.5, w => whoosh(w, 2 * BEAT, .1, -.8, .8, 150, 900));                      // swirling gas
+    [[1, 81], [1.75, 76], [2.5, 74]].forEach(([b, m]) => at(b, w => bell(w, m, .12, m === 76 ? -.4 : .4)));   // Lydian shimmer
+    at(s.beats - 1.6, w => { swell(w, BEAT, .3, 300, 7000); tone(w, 110, BEAT, .06, 'fx', 'sine', 1760); });   // sucked inward
+    at(s.beats - .65, w => { crash(w, .14); noiseHit(w, 'fx', 900, 'lowpass', .5, .25); tone(w, 2400, .3, .05, 'bell', 'sine', 4800); });
+    at(s.beats - .5, w => whoosh(w, .8 * BEAT, .14, -.9, .9, 800, 5000));
+  },
+  moon(s, at) {
+    const [b0, ...v] = s.chord, D = s.beats * BEAT;
+    at(0, (w, o = 0) => pad(w, v, D - o + .3, .1, 2200, .3), D);
+    at(0, w => whoosh(w, 2 * BEAT, .14, -.9, .6, 400, 3500));                  // the comet passes
+    for (let k = 0; k < 2 * s.beats; k++) at(k / 2, w => pluck(w, b0 + [0, 12, 7, 12, 0, 12, 7, 14][k % 8], .34, 0, 'bass', BEAT * .45));   // driving bass
+    for (let k = 0; k < s.beats; k++) at(k, w => k % 2 ? (kick(w, .5), snare(w, .25)) : kick(w, .5));
+    for (let k = 0; k < 2 * s.beats; k++) at(k / 2 + .25, w => hat(w, .06));
+    [72, 74, 76, 79, 81, 79, 84, 86].forEach((m, k) => at(k / 2, w => pluck(w, m, .24, -.5 + k * .14)));   // heroic climb toward Earth
+    at(s.beats - 1, w => swell(w, BEAT, .2, 400, 6000));
+    for (let k = 0; k < 4; k++) at(s.beats - 1 + k / 4, w => snare(w, .08 + k * .04));
+  },
+  tunnel(s, at) {
+    const [b0, ...v] = s.chord, E = s.beats;
+    at(0, w => { boom(w, .45); crash(w, .12); whoosh(w, 1.5 * BEAT, .2, 0, 0, 200, 6000); bass(w, b0, (E - .4) * BEAT, .4); });
+    at(0, (w, o = 0) => pad(w, v, (E - .3) * BEAT - o, .11, 2600, 1.2, .3), (E - .3) * BEAT);
+    const arp = [57, 61, 64, 67, 69, 73, 76, 79];
+    for (let k = 0; k < 4 * E - 1; k++) at(k / 4, w => pluck(w, arp[k % 8] + (k >= 8 ? 12 : 0), .12 + k * .012, k % 2 ? .6 : -.6));   // spiralling arpeggio
+    for (let k = 0; k < E; k++) at(k, w => kick(w, .5));
+    for (let k = 0; k < 2; k++) at(E - 3 + k / 2, w => snare(w, .1));         // roll tightens toward the snap
+    for (let k = 0; k < 4; k++) at(E - 2 + k / 4, w => snare(w, .1 + k * .02));
+    for (let k = 0; k < 6; k++) at(E - 1 + k / 8, w => snare(w, .16 + k * .025));
+    at(E - 3, w => swell(w, 2.7 * BEAT, .3, 200, 9000));
+  },
+  outro(s, at) {
+    const [b0, ...v] = s.chord, D = s.beats * BEAT;
+    at(0, w => {                                                                 // snap back to paper: pop + strummed D6/9
+      tone(w, 500, .06, .3, 'fx', 'sine', 1400); noiseHit(w, 'fx', 4000, 'bandpass', .03, .2);
+      [50, 57, 62, 66, 69, 71, 76].forEach((m, k) => pluck(w + .02 + k * .022, m, .3, -.5 + k * .16));
+      bell(w + .05, 90, .12, .2); crash(w, .06); bass(w, b0, D * .8, .4);
+    });
+    at(0, (w, o = 0) => pad(w, v, D - o + .5, .1, 1500, .6, 2.2), D);
+    at(1, w => { kick(w, .5); tone(w, 170, .16, .3, 'drum', 'sine', 60); });     // landing thud
+    at(1.2, w => { marimba(w, 81, .35, -.2); bell(w, 86, .12, .3); });
+    at(1.45, w => { marimba(w, 86, .4, .2); [93, 90, 86].forEach((m, k) => bell(w + .08 + k * .06, m, .07, .5 - k * .4)); });   // ta-da
+    [2.5, 3.5, 4.5].forEach((b, k) => at(b, w => marimba(w, [62, 66, 69][k], .25, 0)));   // happy hops
+    [[2, 74], [3, 78], [3.5, 81], [4, 79], [5, 78]].forEach(([b, m]) => at(b, w => pluck(w, m, .2, .3)));
+    for (let k = 0; k < 8; k++) at(1.5 + k / 2, w => shaker(w, .05));
+    at(s.beats - .7, w => { if (loopOn) { tone(w, 300, .35, .09, 'fx', 'sine', 1200); whoosh(w, .6 * BEAT, .1, 0, 0, 600, 4000); } });   // jump out (loops back in)
+  },
+};
+function buildScore() {
+  const ev = [];
+  for (const s of S) MUSIC[s.id](s, (beat, f, len = 0) => ev.push({ t: (((s.b0 + beat) * BEAT) % DUR + DUR) % DUR, f, len }));
+  return ev.sort((a, b) => a.t - b.t);
+}
+const SCORE = buildScore();
+
+// =====================================================================
+//  TRANSPORT - the audio clock is the master clock for the visuals
+// =====================================================================
+let playing = false, loopOn = true, t0 = 0, evI = 0, evLoop = 0, rec = null, fresh = true, lastDrawn = -1;
+const q = new URLSearchParams(location.search);
+let pausedAt = q.has('t') ? clamp(+q.get('t') || 0, 0, DUR - .001) : POSTER;
+const START = q.has('t') ? pausedAt : 0;
+const btn = document.getElementById('play'), hint = document.getElementById('hint');
+let HINT = hint.innerHTML;
+// Saving a recording: a plain download when opened as a local file; inside the claude.ai viewer, the host's save dialog.
+const LOCAL = !window.claude, DL = window.claude && window.claude.use ? window.claude.use('downloads').catch(() => null) : Promise.resolve(null);
+let canRecord = false;
+DL.then(d => { canRecord = LOCAL || !!d; if (canRecord) hint.innerHTML = HINT += ' &middot; R record'; });
+const wrapT = t => loopOn ? (t % DUR + DUR) % DUR : clamp(t, 0, DUR - 1e-3);
+function audioNow() {                    // time currently leaving the speakers
+  const ts = AC.getOutputTimestamp && AC.getOutputTimestamp(), p = performance.now();
+  if (ts && ts.contextTime > 0 && p - ts.performanceTime < 250) return ts.contextTime + (p - ts.performanceTime) / 1000;
+  return AC.currentTime - (AC.outputLatency || 0);
+}
+const songTime = () => playing ? audioNow() - t0 : pausedAt;
+function newSession() {
+  if (SES) { const o = SES.out; o.gain.setTargetAtTime(0, AC.currentTime, .015); setTimeout(() => o.disconnect(), 400); }
+  SES = makeSession(AC, MASTER.in);
+}
+function play(from) {
+  initAudio(); newSession();
+  t0 = AC.currentTime + .06 - from; playing = true; fresh = false; btn.hidden = true;
+  evLoop = 0; evI = SCORE.findIndex(e => e.t >= from - 1e-3); if (evI < 0) { evI = 0; evLoop = 1; }
+  for (const e of SCORE) if (e.len && e.t < from && from < e.t + e.len) e.f(AC.currentTime + .06, from - e.t);  // resume held pads
+}
+function stop() {
+  if (!playing) return;
+  pausedAt = wrapT(Math.max(0, songTime())); playing = false; btn.hidden = false;
+  if (SES) { SES.out.gain.setTargetAtTime(0, AC.currentTime, .02); SES = null; }
+}
+const toggle = () => playing ? stop() : play(fresh ? START : pausedAt >= DUR - .01 ? 0 : pausedAt);
+function seek(t) { t = (t % DUR + DUR) % DUR; if (playing) play(t); else { pausedAt = t; fresh = false; } }
+function pump() {                        // look-ahead scheduler (keeps ~300 ms of notes booked)
+  if (!playing) return;
+  const now = AC.currentTime, horizon = now + .3;
+  while (evLoop === 0 || loopOn) {
+    const e = SCORE[evI], at = t0 + evLoop * DUR + e.t;
+    if (at > horizon) break;
+    if (at > now - .05) try { e.f(Math.max(at, now), 0); } catch (err) { console.error(err); }
+    if (++evI === SCORE.length) { evI = 0; evLoop++; }
+  }
+}
+function say(msg) { hint.textContent = msg; clearTimeout(say.t); say.t = setTimeout(() => hint.innerHTML = HINT, 2500); }
+function record() {                      // one pass -> .webm (or .mp4 in Safari), video + audio
+  if (rec || !canRecord) return;
+  const mime = ['video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8,opus', 'video/webm', 'video/mp4'].find(m => window.MediaRecorder && MediaRecorder.isTypeSupported(m));
+  if (!mime) return say('recording is not supported in this browser - see README for screen capture');
+  initAudio();
+  const chunks = [], stream = new MediaStream([...cv.captureStream(60).getVideoTracks(), ...RECDEST.stream.getAudioTracks()]);
+  rec = new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: 12e6 });
+  rec.ondataavailable = e => e.data.size && chunks.push(e.data);
+  rec.onstop = async () => {
+    const name = 'paper-cosmos.' + (mime.includes('mp4') ? 'mp4' : 'webm'), blob = new Blob(chunks, { type: mime });
+    rec = null;
+    if (LOCAL) { const a = document.createElement('a'); a.download = name; a.href = URL.createObjectURL(blob); a.click(); return say('saved ' + name); }
+    try { await (await DL).save({ filename: name, data: blob }); say('saved ' + name); }
+    catch (err) { say(err && err.code === 'declined' ? 'save cancelled' : 'could not save the recording here'); }
+  };
+  play(0); rec.start(); say('recording one pass...');
+}
+function tick() {
+  requestAnimationFrame(tick);
+  pump();
+  const t = songTime();
+  if (playing && !loopOn && t > DUR + 1.5) stop();
+  if (rec && rec.state === 'recording' && t >= DUR + (loopOn ? 0 : 1)) rec.stop();
+  const T = wrapT(Math.max(0, t));
+  if (T !== lastDrawn || playing) { render(T); lastDrawn = T; }
+}
+setInterval(pump, 40);
+btn.onclick = toggle; cv.onclick = toggle;
+addEventListener('keydown', e => {
+  const k = e.code;
+  if (k === 'Space') { e.preventDefault(); toggle(); }
+  else if (k === 'ArrowRight' || k === 'ArrowLeft') seek(wrapT(songTime()) + (k === 'ArrowRight' ? 1 : -1) * (e.shiftKey ? 4 : 1) * BEAT);
+  else if (/^Digit\d$/.test(k)) { const s = S[(+k[5] + 9) % 10]; if (s) seek(s.b0 * BEAT + 1e-3); }
+  else if (k === 'KeyL') { loopOn = !loopOn; say('loop ' + (loopOn ? 'on' : 'off - ends on the last pose')); }
+  else if (k === 'KeyR') record();
+});
+tick();
+</script>
