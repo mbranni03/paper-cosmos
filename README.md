@@ -2,6 +2,8 @@
 
 A ~30 second hand-drawn-looking animation with a procedural soundtrack, in one file: `index.html` (canvas 2D, one WebGL shader, Web Audio). No libraries, no image or audio assets, no network.
 
+**Watch it live:** https://mbranni03.github.io/paper-cosmos/ (press play; browsers need a click before sound).
+
 The original brief is in `PROMPT.md`.
 
 ## Open

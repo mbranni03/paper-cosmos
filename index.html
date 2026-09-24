@@ -912,6 +912,7 @@ function noiseHit(w, bus, freq, type = 'bandpass', dec = .1, vel = .3, pan = 0, 
   n.connect(f); f.connect(g); n.start(w, hash(w * 13) * 1.5, att + dec + .05);
 }
 function pad(w, notes, dur, vel = .1, cut = 1300, att = .8, rel = 1.6) {   // detuned-saw string pad
+  att = Math.min(att, dur);
   const ac = SES.ac, f = ac.createBiquadFilter(), g = ac.createGain(), end = w + dur;
   f.type = 'lowpass'; f.Q.value = .5;
   f.frequency.setValueAtTime(cut * .35, w); f.frequency.linearRampToValueAtTime(cut, w + att * 1.5); f.frequency.setTargetAtTime(cut * .6, w + att * 1.5, dur);
@@ -1094,34 +1095,37 @@ let pausedAt = q.has('t') ? clamp(+q.get('t') || 0, 0, DUR - .001) : POSTER;
 const START = q.has('t') ? pausedAt : 0;
 const btn = document.getElementById('play'), hint = document.getElementById('hint');
 let HINT = hint.innerHTML;
-// Saving a recording: a plain download when opened as a local file; inside the claude.ai viewer, the host's save dialog.
-const LOCAL = !window.claude, DL = window.claude && window.claude.use ? window.claude.use('downloads').catch(() => null) : Promise.resolve(null);
+// Saving a recording: a plain download when the page runs on its own (local file, GitHub Pages); inside the claude.ai viewer, the host's save dialog.
+const STANDALONE = !window.claude || window === window.top, DL = window.claude && window.claude.use ? window.claude.use('downloads').catch(() => null) : Promise.resolve(null);
 let canRecord = false;
-DL.then(d => { canRecord = LOCAL || !!d; if (canRecord) hint.innerHTML = HINT += ' &middot; R record'; });
+DL.then(d => { canRecord = STANDALONE || !!d; if (canRecord) hint.innerHTML = HINT += ' &middot; R record'; });
 const wrapT = t => loopOn ? (t % DUR + DUR) % DUR : clamp(t, 0, DUR - 1e-3);
 function audioNow() {                    // time currently leaving the speakers
   const ts = AC.getOutputTimestamp && AC.getOutputTimestamp(), p = performance.now();
   if (ts && ts.contextTime > 0 && p - ts.performanceTime < 250) return ts.contextTime + (p - ts.performanceTime) / 1000;
   return AC.currentTime - (AC.outputLatency || 0);
 }
-const songTime = () => playing ? audioNow() - t0 : pausedAt;
-function newSession() {
-  if (SES) { const o = SES.out; o.gain.setTargetAtTime(0, AC.currentTime, .015); setTimeout(() => o.disconnect(), 400); }
-  SES = makeSession(AC, MASTER.in);
+// while recording, draw at graph time (what the recorder captures) rather than speaker time
+const songTime = () => playing ? audioNow() + (rec ? (AC.baseLatency || 0) + (AC.outputLatency || 0) : 0) - t0 : pausedAt;
+function endSession() {
+  if (!SES) return;
+  const o = SES.out; o.gain.setTargetAtTime(0, AC.currentTime, .015); setTimeout(() => o.disconnect(), 400); SES = null;
 }
+function newSession() { endSession(); SES = makeSession(AC, MASTER.in); }
 function play(from) {
   initAudio(); newSession();
   t0 = AC.currentTime + .06 - from; playing = true; fresh = false; btn.hidden = true;
-  evLoop = 0; evI = SCORE.findIndex(e => e.t >= from - 1e-3); if (evI < 0) { evI = 0; evLoop = 1; }
-  for (const e of SCORE) if (e.len && e.t < from && from < e.t + e.len) e.f(AC.currentTime + .06, from - e.t);  // resume held pads
+  const lo = from - 5e-3;                // events at the seek point get booked once, never resumed as well
+  evLoop = 0; evI = SCORE.findIndex(e => e.t >= lo); if (evI < 0) { evI = 0; evLoop = 1; }
+  for (const e of SCORE) if (e.len && e.t < lo && from < e.t + e.len) e.f(AC.currentTime + .06, from - e.t);  // resume held pads
 }
 function stop() {
   if (!playing) return;
   pausedAt = wrapT(Math.max(0, songTime())); playing = false; btn.hidden = false;
-  if (SES) { SES.out.gain.setTargetAtTime(0, AC.currentTime, .02); SES = null; }
+  endSession();
 }
-const toggle = () => playing ? stop() : play(fresh ? START : pausedAt >= DUR - .01 ? 0 : pausedAt);
-function seek(t) { t = (t % DUR + DUR) % DUR; if (playing) play(t); else { pausedAt = t; fresh = false; } }
+const toggle = () => rec ? 0 : playing ? stop() : play(fresh ? START : pausedAt >= DUR - .01 ? 0 : pausedAt);   // no pausing a recording
+function seek(t) { if (rec) return; t = (t % DUR + DUR) % DUR; if (playing) play(t); else { pausedAt = t; fresh = false; } }
 function pump() {                        // look-ahead scheduler (keeps ~300 ms of notes booked)
   if (!playing) return;
   const now = AC.currentTime, horizon = now + .3;
@@ -1144,7 +1148,7 @@ function record() {                      // one pass -> .webm (or .mp4 in Safari
   rec.onstop = async () => {
     const name = 'paper-cosmos.' + (mime.includes('mp4') ? 'mp4' : 'webm'), blob = new Blob(chunks, { type: mime });
     rec = null;
-    if (LOCAL) { const a = document.createElement('a'); a.download = name; a.href = URL.createObjectURL(blob); a.click(); return say('saved ' + name); }
+    if (STANDALONE) { const a = document.createElement('a'); a.download = name; a.href = URL.createObjectURL(blob); a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 6e4); return say('saved ' + name); }
     try { await (await DL).save({ filename: name, data: blob }); say('saved ' + name); }
     catch (err) { say(err && err.code === 'declined' ? 'save cancelled' : 'could not save the recording here'); }
   };
@@ -1163,10 +1167,14 @@ setInterval(pump, 40);
 btn.onclick = toggle; cv.onclick = toggle;
 addEventListener('keydown', e => {
   const k = e.code;
-  if (k === 'Space') { e.preventDefault(); toggle(); }
+  if (k === 'Space') { e.preventDefault(); if (!e.repeat) toggle(); }
   else if (k === 'ArrowRight' || k === 'ArrowLeft') seek(wrapT(songTime()) + (k === 'ArrowRight' ? 1 : -1) * (e.shiftKey ? 4 : 1) * BEAT);
   else if (/^Digit\d$/.test(k)) { const s = S[(+k[5] + 9) % 10]; if (s) seek(s.b0 * BEAT + 1e-3); }
-  else if (k === 'KeyL') { loopOn = !loopOn; say('loop ' + (loopOn ? 'on' : 'off - ends on the last pose')); }
+  else if (k === 'KeyL') {
+    loopOn = !loopOn;
+    if (!loopOn && playing) { const n = Math.floor(Math.max(0, songTime()) / DUR); t0 += n * DUR; evLoop -= n; }   // count from this pass
+    say('loop ' + (loopOn ? 'on' : 'off - ends on the last pose'));
+  }
   else if (k === 'KeyR') record();
 });
 tick();
